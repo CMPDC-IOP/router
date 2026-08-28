@@ -57,15 +57,23 @@ impl Router {
         // Update active workers gauge
         RouterMetrics::set_active_workers(worker_urls.len());
 
-        // Wait for workers to be healthy (skip if empty - for service discovery mode)
-        if !worker_urls.is_empty() {
-            Self::wait_for_healthy_workers(
-                &worker_urls,
-                ctx.router_config.worker_startup_timeout_secs,
-                ctx.router_config.worker_startup_check_interval_secs,
+        // Wait for workers to be healthy (skip if empty - for service discovery mode).
+        // Only one healthy host is required so the router can start serving; hosts
+        // that failed the probe are remembered and their workers are registered
+        // unhealthy below, so the background health checker can recover them later
+        // instead of them entering the routable pool while still unreachable.
+        let healthy_hosts = if worker_urls.is_empty() {
+            None
+        } else {
+            Some(
+                Self::wait_for_healthy_hosts(
+                    &worker_urls,
+                    ctx.router_config.worker_startup_timeout_secs,
+                    ctx.router_config.worker_startup_check_interval_secs,
+                )
+                .await?,
             )
-            .await?;
-        }
+        };
 
         // Automatically expand to DP-aware workers when intra_node_data_parallel_size > 1
         let worker_urls = if ctx.router_config.intra_node_data_parallel_size > 1 {
@@ -103,11 +111,11 @@ impl Router {
         for url in &worker_urls {
             // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
             // For now, create worker without model_id
+            let (base_url, dp_rank) = dp_utils::parse_worker_url(url);
             let worker_arc: Arc<dyn Worker> = if dp_size > 1 {
-                let (base_url, dp_rank) = dp_utils::parse_worker_url(url);
                 Arc::new(
                     DPAwareWorker::new(
-                        base_url,
+                        base_url.clone(),
                         dp_rank.unwrap_or(0),
                         dp_size,
                         WorkerType::Regular,
@@ -122,6 +130,21 @@ impl Router {
                         .with_health_config(health_config.clone()),
                 )
             };
+
+            // Workers whose host did not answer the startup probe start
+            // unhealthy: they stay in the registry (the background health
+            // checker recovers them once they become reachable) but are
+            // filtered out of the routable pool until then.
+            if let Some(healthy_hosts) = &healthy_hosts {
+                if !healthy_hosts.contains(&base_url) {
+                    worker_arc.set_healthy(false);
+                    warn!(
+                        "Worker {} did not answer the startup probe; registered as unhealthy and excluded from routing until a health check succeeds",
+                        url
+                    );
+                }
+            }
+
             ctx.worker_registry.register(worker_arc.clone());
 
             // Notify PolicyRegistry about the new worker
@@ -210,19 +233,34 @@ impl Router {
         }
 
         // Perform health check asynchronously
-        Self::wait_for_healthy_workers_async(
+        Self::wait_for_healthy_hosts(
             worker_urls,
             worker_startup_timeout_secs,
             worker_startup_check_interval_secs,
         )
         .await
+        .map(|_| ())
     }
 
-    async fn wait_for_healthy_workers_async(
+    /// Wait until at least one host is healthy, returning the set of base URLs
+    /// (without DP rank suffix) that answered the startup probe.
+    ///
+    /// Hosts missing from the returned set failed the probe: callers that
+    /// register workers for them must start them unhealthy so the background
+    /// health checker can bring them into the routable pool once they come up.
+    /// This keeps rolling startups working: the router serves traffic as soon
+    /// as one worker is available without assuming the others are.
+    async fn wait_for_healthy_hosts(
         worker_urls: &[String],
         worker_startup_timeout_secs: u64,
         worker_startup_check_interval_secs: u64,
-    ) -> Result<(), String> {
+    ) -> Result<std::collections::HashSet<String>, String> {
+        if worker_urls.is_empty() {
+            return Err(
+                "Timeout waiting for workers to become healthy: no workers provided".to_string(),
+            );
+        }
+
         // Extract unique base URLs (hosts) for health checks
         // This deduplicates DP-aware URLs like http://host:8081@0, @1, @2, @3
         // to only check http://host:8081 once
@@ -281,16 +319,12 @@ impl Router {
 
                 let check_health = tokio::spawn(async move {
                     let health_url = format!("{}/health", url_clone);
-                    match client_clone.get(&health_url).send().await {
-                        Ok(res) => {
-                            if res.status().is_success() {
-                                None
-                            } else {
-                                Some((url_clone, format!("status: {}", res.status())))
-                            }
-                        }
-                        Err(_) => Some((url_clone, "not ready".to_string())),
-                    }
+                    let reason = match client_clone.get(&health_url).send().await {
+                        Ok(res) if res.status().is_success() => None,
+                        Ok(res) => Some(format!("status: {}", res.status())),
+                        Err(_) => Some("not ready".to_string()),
+                    };
+                    (url_clone, reason)
                 });
 
                 health_checks.push(check_health);
@@ -300,15 +334,15 @@ impl Router {
             let results = futures::future::join_all(health_checks).await;
 
             let mut unhealthy_hosts = Vec::new();
-            let mut healthy_host_count = 0;
+            let mut healthy_hosts = HashSet::new();
 
             for result in results {
                 match result {
-                    Ok(None) => {
-                        healthy_host_count += 1;
+                    Ok((url, None)) => {
                         // Host is healthy
+                        healthy_hosts.insert(url);
                     }
-                    Ok(Some((url, reason))) => {
+                    Ok((url, Some(reason))) => {
                         unhealthy_hosts.push((url, reason));
                     }
                     Err(e) => {
@@ -317,14 +351,14 @@ impl Router {
                 }
             }
 
-            if healthy_host_count > 0 {
+            if !healthy_hosts.is_empty() {
                 info!(
                     "{} out of {} unique hosts are healthy (representing {} workers)",
-                    healthy_host_count,
+                    healthy_hosts.len(),
                     unique_hosts_vec.len(),
                     worker_urls.len()
                 );
-                return Ok(());
+                return Ok(healthy_hosts);
             } else {
                 debug!(
                    "Waiting for at least 1 of {} unique hosts to become healthy ({} unhealthy: {:?})",
