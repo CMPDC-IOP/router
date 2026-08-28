@@ -1074,4 +1074,124 @@ mod dp_e2e_tests {
         prefill_worker.stop().await;
         decode_worker.stop().await;
     }
+
+    // -----------------------------------------------------------------
+    // DP > 1: remove_worker must clean the cache-aware tree
+    // -----------------------------------------------------------------
+    // The DP removal path used to re-fetch each worker from the registry
+    // *after* removing it, so the lookup always failed and the dp-expanded
+    // tenants of the removed host stayed in the cache-aware tree forever.
+
+    #[tokio::test]
+    async fn test_dp_remove_worker_cleans_cache_aware_tree() {
+        let start_worker = || async {
+            let mut worker = MockWorker::new(MockWorkerConfig {
+                port: 0,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
+            });
+            let url = worker.start().await.unwrap();
+            (worker, url)
+        };
+        let (worker_a, url_a) = start_worker().await;
+        let (worker_b, url_b) = start_worker().await;
+
+        let config = RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec![url_a.clone(), url_b.clone()],
+            },
+            policy: PolicyConfig::CacheAware {
+                cache_threshold: 0.3,
+                balance_abs_threshold: 999,
+                balance_rel_threshold: 9.9,
+                // Disable the eviction thread: the tree state below must be
+                // explained by removal alone.
+                eviction_interval_secs: 0,
+                max_tree_size: 100_000,
+            },
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            max_payload_size: 256 * 1024 * 1024,
+            request_timeout_secs: 10,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 2,
+            api_key: None,
+            api_key_validation_urls: vec![],
+            discovery: None,
+            metrics: None,
+            log_dir: None,
+            log_level: None,
+            request_id_headers: None,
+            max_concurrent_requests: 64,
+            queue_size: 0,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
+            cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: vllm_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            history_backend: vllm_router_rs::config::HistoryBackend::Memory,
+            enable_profiling: false,
+            profile_timeout_secs: 30,
+            kv_connector: vllm_router_rs::config::KvConnector::Nixl,
+        };
+        let app_context = common::create_test_context(config.clone());
+        let router = RouterFactory::create_router(&app_context).await.unwrap();
+        let router: Arc<dyn vllm_router_rs::routers::RouterTrait> = Arc::from(router);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // Workers register without a model label, so the policy lives under
+        // the workers' default model id.
+        let model_key = app_context.worker_registry.get_all()[0]
+            .model_id()
+            .to_string();
+        let policy = app_context
+            .policy_registry
+            .get_policy(&model_key)
+            .expect("cache-aware policy must be registered");
+        let cache_aware = policy
+            .as_any()
+            .downcast_ref::<vllm_router_rs::policies::CacheAwarePolicy>()
+            .expect("policy must be cache-aware");
+
+        // dp_size=2 expands each host into two ranks, each a tree tenant.
+        let counts_before = cache_aware.get_tenant_char_counts("");
+        assert_eq!(
+            counts_before.len(),
+            4,
+            "dp expansion must register one tree tenant per rank, got {counts_before:?}"
+        );
+
+        // Removing host A must drop both of its ranks from the tree.
+        router.remove_worker(&url_a);
+
+        let counts_after = cache_aware.get_tenant_char_counts("");
+        assert_eq!(
+            counts_after.len(),
+            2,
+            "removed host's ranks must leave the cache-aware tree, got {counts_after:?}"
+        );
+        assert!(
+            !counts_after.keys().any(|tenant| tenant.starts_with(&url_a)),
+            "host A tenants must be gone, got {counts_after:?}"
+        );
+        assert!(
+            counts_after.keys().any(|tenant| tenant.starts_with(&url_b)),
+            "host B tenants must be untouched, got {counts_after:?}"
+        );
+
+        let mut worker_a = worker_a;
+        let mut worker_b = worker_b;
+        worker_a.stop().await;
+        worker_b.stop().await;
+    }
 }

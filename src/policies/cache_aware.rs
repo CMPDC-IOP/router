@@ -55,8 +55,10 @@
     Interval between LRU eviction cycles for the approximate trees.
 
     5. max_tree_size: (integer)
-    Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
-    during the next eviction cycle.
+    Maximum characters stored per tenant (one worker URL in one model's
+    tree). When a tenant exceeds it, its LRU leaf nodes are evicted during
+    the next eviction cycle; inserts for a tenant at its budget are skipped
+    until then.
 */
 
 use super::{get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, RequestHeaders};
@@ -171,6 +173,18 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// Per-tenant character counts for one model's tree (empty map if the
+    /// model has no tree). Diagnostic: these are the same numbers the
+    /// eviction thread enforces `max_tree_size` against, exposed so callers
+    /// can see how close each worker's cache tree is to its budget.
+    pub fn get_tenant_char_counts(&self, model_id: &str) -> HashMap<String, usize> {
+        let tree_key = normalize_model_key(model_id);
+        self.trees
+            .get(tree_key)
+            .map(|tree| tree.get_tenant_char_count())
+            .unwrap_or_default()
+    }
+
     fn select_worker_min_load(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -207,7 +221,7 @@ impl CacheAwarePolicy {
 
             if let Some(tree) = tree {
                 let worker_url = workers[min_load_idx].url();
-                tree.insert(text, worker_url);
+                tree.insert_capped(text, worker_url, self.config.max_tree_size);
             } else {
                 debug!(
                     "Warning: No tree found for model '{}', skipping cache update",
@@ -327,8 +341,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         };
 
         if let Some(idx) = selected_idx {
-            // Update the tree with this request (use worker URL directly, no allocation)
-            tree.insert(text, workers[idx].url());
+            // Update the tree with this request (use worker URL directly, no
+            // allocation). Capped so a full tenant stops learning instead of
+            // growing past its budget between eviction passes.
+            tree.insert_capped(text, workers[idx].url(), self.config.max_tree_size);
 
             // Increment processed counter
             workers[idx].increment_processed();
@@ -540,6 +556,46 @@ mod tests {
             let idx = policy.select_worker(&workers, Some("test")).unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
+    }
+
+    #[test]
+    fn test_cache_aware_respects_max_tree_size_between_evictions() {
+        // A tiny budget with eviction disabled: nothing evicts in the
+        // background, so the insert-time cap is the only thing bounding the
+        // tree. Requests must still route while the tenant is full.
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0, // Disable eviction thread
+            max_tree_size: 50,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "http://w1:8000".to_string(),
+            WorkerType::Regular,
+        ))];
+        policy.init_workers(&workers);
+
+        // 40-char texts: two fit under the 50-char budget, the rest must be
+        // skipped rather than growing the tree past the cap.
+        for i in 0..20 {
+            let text = format!("request-number-{:020}", i);
+            assert!(
+                policy.select_worker(&workers, Some(&text)).is_some(),
+                "routing must continue while the tenant is at its budget"
+            );
+        }
+
+        let counts = policy.get_tenant_char_counts(workers[0].model_id());
+        let url = workers[0].url();
+        assert!(
+            counts.contains_key(url),
+            "the worker's tenant must exist in its model tree, got {counts:?}"
+        );
+        assert!(
+            counts.get(url).copied().unwrap_or(0) <= 50,
+            "tenant must stay at its char budget between evictions, got {:?}",
+            counts
+        );
     }
 
     #[test]

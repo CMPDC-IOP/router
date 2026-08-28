@@ -209,13 +209,17 @@ vllm-router --policy cache_aware \
 
 ### Parameters
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `cache_threshold` | 0.5 | Minimum prefix match ratio to use cache-based routing |
-| `balance_abs_threshold` | 32 | Absolute load difference threshold for load balancing |
-| `balance_rel_threshold` | 1.1 | Relative load ratio threshold for load balancing |
-| `eviction_interval_secs` | 30 | Interval for cache eviction |
-| `max_tree_size` | 10000 | Maximum nodes per radix tree |
+| Parameter | CLI default | Library default | Description |
+|-----------|---------|-------------|-------------|
+| `cache_threshold` | 0.3 | 0.5 | Minimum prefix match ratio to use cache-based routing |
+| `balance_abs_threshold` | 64 | 32 | Absolute load difference threshold for load balancing |
+| `balance_rel_threshold` | 1.5 | 1.1 | Relative load ratio threshold for load balancing |
+| `eviction_interval_secs` | 120 | 30 | Interval for cache eviction |
+| `max_tree_size` | 2^26 | 10000 | Maximum characters stored per worker (tenant) in the approximate tree, deduplicated across shared prefixes. Workers at their budget stop updating the tree until the next eviction pass. See [cache_aware_memory.md](cache_aware_memory.md) for measured memory bounds |
+
+The CLI default column shows `--router-args` / `RouterArgs` defaults; the
+library default column shows `CacheAwareConfig::default()` used when the
+policy is constructed without CLI configuration.
 
 ### Behavior
 

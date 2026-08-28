@@ -48,16 +48,23 @@ struct TestContext {
 impl TestContext {
     /// Build a router for the given URLs, with a fast background health
     /// checker so late-starting workers are recovered quickly.
+    ///
+    /// The policy is round-robin on purpose: cache-aware routing pins every
+    /// identical request to whichever worker first served it, so a recovered
+    /// late worker would only receive traffic by luck of registry iteration
+    /// order. Round-robin guarantees it is picked once it is healthy.
     async fn new(worker_urls: Vec<String>, startup_timeout_secs: u64) -> Self {
+        Self::with_policy(worker_urls, startup_timeout_secs, PolicyConfig::RoundRobin).await
+    }
+
+    async fn with_policy(
+        worker_urls: Vec<String>,
+        startup_timeout_secs: u64,
+        policy: PolicyConfig,
+    ) -> Self {
         let config = RouterConfig {
             mode: RoutingMode::Regular { worker_urls },
-            policy: PolicyConfig::CacheAware {
-                cache_threshold: 0.3,
-                balance_abs_threshold: 999,
-                balance_rel_threshold: 9.9,
-                eviction_interval_secs: 0,
-                max_tree_size: 1000,
-            },
+            policy,
             port: 3005,
             worker_startup_timeout_secs: startup_timeout_secs,
             worker_startup_check_interval_secs: 1,

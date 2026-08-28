@@ -526,6 +526,29 @@ impl Tree {
             .insert(Arc::clone(&tenant_id), epoch);
     }
 
+    /// Insert the text unless the tenant already sits at its `max_chars`
+    /// budget, returning whether the insert happened.
+    ///
+    /// The background eviction thread only enforces `max_tree_size` once per
+    /// eviction interval, and `insert` itself never consults the cap, so a
+    /// busy tenant could outrun its budget without bound between passes. The
+    /// O(1) check here makes the cap hold continuously: once a tenant reaches
+    /// the budget its inserts are skipped (a cache-tree update is lost, not a
+    /// request) until eviction frees space. Overshoot past the cap is bounded
+    /// by one request's text.
+    pub fn insert_capped(&self, text: &str, tenant: &str, max_chars: usize) -> bool {
+        if max_chars == 0 {
+            return false;
+        }
+        if let Some(count) = self.tenant_char_count.get(tenant) {
+            if *count >= max_chars {
+                return false;
+            }
+        }
+        self.insert(text, tenant);
+        true
+    }
+
     /// Performs prefix matching and returns detailed result with char counts.
     /// Optimized: no string allocations, deferred char counting.
     pub fn prefix_match_with_counts(&self, text: &str) -> PrefixMatchResult {
@@ -1725,6 +1748,38 @@ mod tests {
     }
 
     // ==================== Edge Case Tests ====================
+
+    #[test]
+    fn test_insert_capped_stops_at_budget() {
+        let tree = Tree::new();
+        let max_chars = 100;
+
+        // Ten disjoint 10-char texts fill the budget exactly. (The counter
+        // tracks deduplicated chars a tenant owns, so disjoint texts keep
+        // sum-of-lengths and ownership in lockstep here.)
+        for i in 0..10u8 {
+            let text = format!("{}012345678", (b'a' + i) as char);
+            assert!(tree.insert_capped(&text, "tenant1", max_chars));
+        }
+        assert_eq!(tree.tenant_char_count.get("tenant1").map(|v| *v), Some(100));
+
+        // Further inserts are skipped without eviction ever running.
+        for i in 10..20u8 {
+            let text = format!("{}012345678", (b'a' + i) as char);
+            assert!(!tree.insert_capped(&text, "tenant1", max_chars));
+        }
+        assert_eq!(tree.tenant_char_count.get("tenant1").map(|v| *v), Some(100));
+
+        // Other tenants are unaffected by tenant1's full budget.
+        assert!(tree.insert_capped("hello", "tenant2", max_chars));
+
+        // A zero budget admits nothing.
+        assert!(!tree.insert_capped("x", "tenant3", 0));
+
+        // After eviction frees space, inserts resume.
+        tree.evict_tenant_by_size(50);
+        assert!(tree.insert_capped("fresh-entry", "tenant1", max_chars));
+    }
 
     #[test]
     fn test_empty_string_input() {
