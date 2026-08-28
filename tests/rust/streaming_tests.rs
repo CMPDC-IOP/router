@@ -134,6 +134,7 @@ mod streaming_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 10,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -165,6 +166,7 @@ mod streaming_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 10,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -210,6 +212,7 @@ mod streaming_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 10,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -237,6 +240,7 @@ mod streaming_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 1.0, // Always fail
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -260,6 +264,7 @@ mod streaming_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 100, // Slow response
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -293,6 +298,7 @@ mod streaming_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 10,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 

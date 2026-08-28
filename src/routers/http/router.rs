@@ -2030,6 +2030,17 @@ impl Router {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
 
+        if is_stream && is_retryable_status(status) {
+            // Error headers release backend occupancy immediately. Preserve
+            // the body in case this is the final response sent to the client.
+            load.release();
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let mut response = Response::new(Body::from_stream(res.bytes_stream()));
+            *response.status_mut() = status;
+            *response.headers_mut() = response_headers;
+            return response;
+        }
+
         if !is_stream {
             // For non-streaming requests, preserve headers
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -2118,15 +2129,6 @@ impl Router {
                             }
                             if let Some(completion) = &completion {
                                 completion.observe_sse_chunk(&bytes);
-                            }
-                            // Check for stream end marker
-                            if completion_echo.is_none()
-                                && bytes
-                                    .as_ref()
-                                    .windows(12)
-                                    .any(|window| window == b"data: [DONE]")
-                            {
-                                producer_load.release();
                             }
                             let has_output = completion_output
                                 .as_mut()
