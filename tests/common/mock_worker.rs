@@ -26,6 +26,9 @@ pub struct MockWorkerConfig {
     pub health_status: HealthStatus,
     pub response_delay_ms: u64,
     pub fail_rate: f32,
+    /// Delay between streamed SSE chunks (0 = instant stream). Used by load
+    /// tracking tests to hold a stream open while asserting worker load.
+    pub stream_chunk_delay_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -422,25 +425,51 @@ async fn chat_completions_handler(
 
     if is_stream {
         let request_id = format!("chatcmpl-{}", Uuid::new_v4());
+        let chunk_delay = config.stream_chunk_delay_ms;
 
-        let stream = stream::once(async move {
-            let chunk = json!({
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": timestamp,
-                "model": "mock-model",
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "content": "This is a mock chat response."
-                    },
-                    "finish_reason": null
-                }]
-            });
+        // In slow mode, embed the literal end-of-stream marker inside chunk
+        // content so load-tracking tests can verify the router does not end
+        // forwarding early when it sees that string mid-stream.
+        let contents: Vec<&str> = if chunk_delay > 0 {
+            vec![
+                "Slow chunk 1.",
+                "This content mentions data: [DONE] but is not the marker.",
+                "Slow chunk 3.",
+            ]
+        } else {
+            vec!["This is a mock chat response."]
+        };
 
-            Ok::<_, Infallible>(Event::default().data(chunk.to_string()))
-        })
-        .chain(stream::once(async { Ok(Event::default().data("[DONE]")) }));
+        let stream = stream::iter(contents.into_iter().enumerate().map(move |(i, content)| {
+            let request_id = request_id.clone();
+            async move {
+                if chunk_delay > 0 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(chunk_delay)).await;
+                }
+                let chunk = json!({
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": timestamp,
+                    "model": "mock-model",
+                    "choices": [{
+                        "index": i,
+                        "delta": {
+                            "content": content
+                        },
+                        "finish_reason": null
+                    }]
+                });
+
+                Ok::<_, Infallible>(Event::default().data(chunk.to_string()))
+            }
+        }))
+        .then(|fut| fut)
+        .chain(stream::once(async move {
+            if chunk_delay > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(chunk_delay)).await;
+            }
+            Ok::<_, Infallible>(Event::default().data("[DONE]"))
+        }));
 
         Sse::new(stream)
             .keep_alive(KeepAlive::default())
@@ -871,6 +900,7 @@ impl Default for MockWorkerConfig {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }
     }
 }
