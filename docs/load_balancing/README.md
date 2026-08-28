@@ -213,7 +213,7 @@ vllm-router --policy cache_aware \
 
 ### Parameters
 
-| Parameter | Default | Description |
+| Parameter | Library default | Description |
 |-----------|---------|-------------|
 | `cache_threshold` | 0.5 | Minimum prefix match ratio over the full input |
 | `balance_abs_threshold` | 32 | Absolute load difference threshold for load balancing |
@@ -221,7 +221,7 @@ vllm-router --policy cache_aware \
 | `eviction_interval_secs` | 30 | Interval for cache eviction |
 | `max_tree_size` | 33,554,432 (`2^25`) | Character budget per worker per model |
 
-Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyond it between cycles. This character budget is not a memory limit; actual memory usage also includes tree overhead and scales with the number of workers and models.
+Nonempty tree updates stop once a worker reaches `max_tree_size`; overshoot is bounded by one routing key until eviction frees space. This character budget is not a byte limit: effective token keys use eight ASCII characters per token, and heap usage also includes node overhead. See [measured memory bounds](cache_aware_memory.md). CLI defaults are listed in the [CLI reference](../cli_reference.md).
 
 ### Behavior
 

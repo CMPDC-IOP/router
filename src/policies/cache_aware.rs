@@ -57,9 +57,9 @@
 
     5. max_tree_size: (integer)
     Maximum characters per worker in each model tree, shared across LoRA and
-    cache-salt identities. When exceeded, LRU
-    leaf entries are evicted during the next eviction cycle. This is not
-    a hard process-memory limit.
+    cache-salt identities. Inserts for a worker at its budget are skipped
+    until LRU eviction frees space. One admitted prompt can exceed the budget;
+    this is not a hard process-memory limit.
 */
 
 use super::{
@@ -191,7 +191,7 @@ impl CacheAwarePolicy {
         self.trees
             .entry(normalize_model_key(model_id).to_string())
             .or_insert_with(|| Arc::new(Tree::new()))
-            .insert(request_text, target_id);
+            .insert_capped(request_text, target_id, self.config.max_tree_size);
     }
 
     /// Remove one unavailable target from a model's affinity tree.
@@ -368,7 +368,9 @@ impl CacheAwarePolicy {
             .min_by_key(|&i| workers[healthy[i]].load())?;
         let index = healthy[position];
         for key in &matches[position].0 {
-            prepared.tree.insert(key, workers[index].url());
+            prepared
+                .tree
+                .insert_capped(key, workers[index].url(), self.config.max_tree_size);
         }
         RouterMetrics::record_prefix_routing_decision(
             "cache_aware",
@@ -390,6 +392,18 @@ impl CacheAwarePolicy {
         );
         Self::record_selection(workers, index);
         Some(index)
+    }
+
+    /// Per-tenant character counts for one model's tree (empty map if the
+    /// model has no tree). Diagnostic: these are the same numbers the
+    /// eviction thread enforces `max_tree_size` against, exposed so callers
+    /// can see how close each worker's cache tree is to its budget.
+    pub fn get_tenant_char_counts(&self, model_id: &str) -> HashMap<String, usize> {
+        let tree_key = normalize_model_key(model_id);
+        self.trees
+            .get(tree_key)
+            .map(|tree| tree.get_tenant_char_count())
+            .unwrap_or_default()
     }
 
     fn select_worker_min_load(
@@ -421,7 +435,7 @@ impl CacheAwarePolicy {
             self.trees
                 .entry(model_id.to_owned())
                 .or_insert_with(|| Arc::new(Tree::new()))
-                .insert(text, workers[min_load_idx].url());
+                .insert_capped(text, workers[min_load_idx].url(), self.config.max_tree_size);
         }
 
         Self::record_selection(workers, min_load_idx);
@@ -509,7 +523,7 @@ impl CacheAwarePolicy {
             if let Some(text) = request_text {
                 let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
                 if let Some(tree) = tree {
-                    tree.insert(text, workers[idx].url());
+                    tree.insert_capped(text, workers[idx].url(), self.config.max_tree_size);
                 }
             }
             RouterMetrics::record_load_balancing_event();
@@ -548,7 +562,7 @@ impl CacheAwarePolicy {
             } else if !imbalanced || request_text.is_some() {
                 // Publish placement before returning, but do not serialize other
                 // admissions behind a potentially long radix-tree insertion.
-                tree.insert(text, workers[idx].url());
+                tree.insert_capped(text, workers[idx].url(), self.config.max_tree_size);
             }
         }
         if imbalanced {
@@ -595,7 +609,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     tree.remove_tenant(result.tenant.as_ref());
                 }
             } else {
-                tree.insert(text, workers[idx].url());
+                tree.insert_capped(text, workers[idx].url(), self.config.max_tree_size);
             }
         }
         Self::record_selection(workers, idx);
@@ -792,7 +806,8 @@ mod tests {
     fn cache_identity_scopes_share_budget_without_sharing_prefix_credit() {
         let config = CacheAwareConfig {
             cache_threshold: 0.4,
-            max_tree_size: 256,
+            // Leave room to learn all four identities before exercising the cap.
+            max_tree_size: 512,
             eviction_interval_secs: 0,
             ..Default::default()
         };
@@ -847,33 +862,81 @@ mod tests {
                 Some(1)
             );
         }
-        // Each salted prompt fits the budget individually. Their combined
-        // history must still be reclaimed, for every worker, on each cycle.
+        // All identities share one admission budget. Once full, further salts
+        // must not grow it; eviction then lets every worker learn again.
         for cycle in 0..2 {
             for session in 0..32 {
                 let salt = format!("session-{cycle}-{session}");
                 for worker in &workers {
-                    policy.select_worker_with_inputs(
-                        std::slice::from_ref(worker),
-                        KvRequestTokens::Shared(Some(&ids)),
-                        Some("model"),
-                        None,
-                        Some(&salt),
-                        "prefill",
+                    let before = policy
+                        .get_tenant_char_counts("model")
+                        .get(worker.url())
+                        .copied()
+                        .unwrap_or(0);
+                    assert_eq!(
+                        policy.select_worker_with_inputs(
+                            std::slice::from_ref(worker),
+                            KvRequestTokens::Shared(Some(&ids)),
+                            Some("model"),
+                            None,
+                            Some(&salt),
+                            "prefill",
+                        ),
+                        Some(0)
                     );
+                    if before >= config.max_tree_size {
+                        assert_eq!(policy.get_tenant_char_counts("model")[worker.url()], before);
+                    }
                 }
             }
             assert_eq!(policy.trees.len(), 1);
             let tree = policy.trees.get("model").unwrap();
             for worker in &workers {
-                assert!(tree.get_tenant_char_count()[worker.url()] > config.max_tree_size);
+                assert!(tree.get_tenant_char_count()[worker.url()] >= config.max_tree_size);
             }
             drop(tree);
-            policy.evict_cache(config.max_tree_size);
+            policy.evict_cache(0);
             let tree = policy.trees.get("model").unwrap();
             for worker in &workers {
-                assert!(tree.get_tenant_char_count()[worker.url()] <= config.max_tree_size);
+                assert_eq!(tree.get_tenant_char_count()[worker.url()], 0);
             }
+        }
+    }
+
+    #[test]
+    fn effective_batch_prompts_respect_the_admission_budget() {
+        let max_tree_size = cache_routing::tokens(&[1]).chars().count();
+        let (policy, workers) = cache_fixture(
+            1,
+            CacheAwareConfig {
+                max_tree_size,
+                ..Default::default()
+            },
+        );
+        let prompts: Arc<[Vec<u32>]> = Arc::from(vec![vec![1], vec![2], vec![3]]);
+        let inputs = workers
+            .iter()
+            .map(|worker| (worker.base_url().to_owned(), prompts.clone()))
+            .collect();
+        for _ in 0..2 {
+            assert_eq!(
+                policy.select_worker_with_inputs(
+                    &workers,
+                    KvRequestTokens::PerWorker(&inputs),
+                    Some("model"),
+                    None,
+                    None,
+                    "regular",
+                ),
+                Some(0)
+            );
+            // The first prompt fills the budget exactly. Later prompts in
+            // the same batch and subsequent requests must still route, but
+            // must not add history while the tenant is full.
+            assert_eq!(
+                policy.get_tenant_char_counts("model")[workers[0].url()],
+                max_tree_size
+            );
         }
     }
 
@@ -1415,6 +1478,46 @@ mod tests {
             let idx = policy.select_worker(&workers, Some("test")).unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
+    }
+
+    #[test]
+    fn test_cache_aware_respects_max_tree_size_between_evictions() {
+        // A tiny budget with eviction disabled: nothing evicts in the
+        // background, so the insert-time cap is the only thing bounding the
+        // tree. Requests must still route while the tenant is full.
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0, // Disable eviction thread
+            max_tree_size: 50,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+            "http://w1:8000".to_string(),
+            WorkerType::Regular,
+        ))];
+        policy.init_workers(&workers);
+
+        // 40-char texts: two fit under the 50-char budget, the rest must be
+        // skipped rather than growing the tree past the cap.
+        for i in 0..20 {
+            let text = format!("request-number-{:020}", i);
+            assert!(
+                policy.select_worker(&workers, Some(&text)).is_some(),
+                "routing must continue while the tenant is at its budget"
+            );
+        }
+
+        let counts = policy.get_tenant_char_counts(workers[0].model_id());
+        let url = workers[0].url();
+        assert!(
+            counts.contains_key(url),
+            "the worker's tenant must exist in its model tree, got {counts:?}"
+        );
+        assert!(
+            counts.get(url).copied().unwrap_or(0) <= 50,
+            "tenant must stay at its char budget between evictions, got {:?}",
+            counts
+        );
     }
 
     #[test]
