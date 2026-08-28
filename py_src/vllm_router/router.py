@@ -33,19 +33,21 @@ class Router:
             - PolicyType.PowerOfTwo: Select best of two random workers based on load (PD mode only)
         host: Host address to bind the router server. Default: '127.0.0.1'
         port: Port number to bind the router server. Default: 3001
-        worker_startup_timeout_secs: Timeout in seconds for worker startup. Default: 300
-        worker_startup_check_interval: Interval in seconds between checks for worker initialization. Default: 10
+        worker_startup_timeout_secs: Timeout in seconds for worker startup. Default: 600
+        worker_startup_check_interval: Interval in seconds between checks for worker initialization. Default: 30
         cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to cached worker
             if the match rate exceeds threshold, otherwise routes to the worker with the smallest
-            tree. Default: 0.5
+            tree. Default: 0.3
         balance_abs_threshold: Load balancing is triggered when (max_load - min_load) > abs_threshold
-            AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 32
+            AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 64
         balance_rel_threshold: Load balancing is triggered when (max_load - min_load) > abs_threshold
-            AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 1.0001
+            AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 1.5
         eviction_interval_secs: Interval in seconds between cache eviction operations in cache-aware
-            routing. Default: 60
-        max_payload_size: Maximum payload size in bytes. Default: 256MB
-        max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
+            routing. Default: 120
+        max_payload_size: Maximum payload size in bytes. Default: 512MB
+        max_tree_size: Maximum characters stored per worker in the approximation tree for
+            cache-aware routing (deduplicated per tenant; inserts for a worker at its budget are
+            skipped until the next eviction pass). Default: 2^26
         intra_node_data_parallel_size: Data parallel size for DP-aware routing (automatically enabled when > 1). Default: 1
         enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When enabled,
             the router can manage multiple models simultaneously with per-model load balancing
