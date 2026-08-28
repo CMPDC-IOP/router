@@ -528,6 +528,12 @@ pub async fn concurrency_limit_middleware(
             // Try to send to queue
             match queue_tx.try_send(queued) {
                 Ok(_) => {
+                    // Count requests only after they are accepted by the
+                    // bounded queue. The guard remains live while waiting
+                    // for the queue processor and is dropped on every
+                    // timeout, channel-error, or cancellation path.
+                    let waiting_guard = app_state.context.request_metrics.begin_waiting();
+
                     // On successful enqueue, update embeddings queue gauge if applicable
                     if is_embeddings {
                         let new_val = EMBEDDINGS_QUEUE_SIZE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -538,6 +544,10 @@ pub async fn concurrency_limit_middleware(
                     match permit_rx.await {
                         Ok(Ok(())) => {
                             debug!("Acquired token from queue");
+                            // Admission waiting has ended; do not count the
+                            // request while it is executing downstream.
+                            drop(waiting_guard);
+
                             // Dequeue for embeddings
                             if is_embeddings {
                                 let new_val =
