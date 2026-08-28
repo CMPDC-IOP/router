@@ -562,8 +562,8 @@ impl GenerationRequest for ChatCompletionRequest {
             .and_then(|params| params.get("session_id"))
             .and_then(Value::as_str)
             .filter(|session_id| !session_id.trim().is_empty())
-            .unwrap_or_default()
-            .to_string()
+            .map(str::to_string)
+            .unwrap_or_else(|| serde_json::to_string(&self.messages).unwrap_or_default())
     }
 
     fn extract_text_for_program_scheduling(&self) -> String {
@@ -3414,6 +3414,31 @@ mod tests {
         let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         assert!(request.model.is_none());
         assert_eq!(request.get_model(), None);
+    }
+
+    #[test]
+    fn test_chat_completion_without_session_id_has_routing_text() {
+        let json = r#"{
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        let routing_text = request.extract_text_for_routing();
+        assert!(!routing_text.is_empty());
+        assert!(routing_text.contains("Hello"));
+    }
+
+    #[test]
+    fn test_chat_completion_session_id_remains_routing_key() {
+        let json = r#"{
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "session_params": {"session_id": "session-123"}
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.extract_text_for_routing(), "session-123");
     }
 
     #[test]
