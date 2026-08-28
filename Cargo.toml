@@ -355,3 +355,7 @@ opt-level = 1
 [[test]]
 name = "load_tracking_test"
 path = "tests/rust/load_tracking_test.rs"
+
+[[test]]
+name = "worker_startup_test"
+path = "tests/rust/worker_startup_test.rs"
