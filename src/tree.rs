@@ -1,7 +1,7 @@
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, VecDeque},
-    hash::{BuildHasherDefault, Hasher},
+    hash::{BuildHasherDefault, Hash, Hasher},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, RwLock,
@@ -22,6 +22,7 @@ type NodeRef = Arc<Node>;
 /// This reduces memory by ~90% vs default while maintaining good concurrency.
 const ROOT_SHARD_COUNT: usize = 32;
 const NODE_SHARD_COUNT: usize = 8;
+const CAPPED_INSERT_LOCK_SHARDS: usize = 64;
 
 /// Create a children DashMap for non-root nodes
 #[inline]
@@ -33,6 +34,13 @@ fn new_children_map() -> DashMap<char, NodeRef, CharHasherBuilder> {
 #[inline]
 fn new_tenant_map() -> DashMap<TenantId, u64> {
     DashMap::with_shard_amount(NODE_SHARD_COUNT)
+}
+
+#[inline]
+fn capped_insert_lock_index(tenant: &str) -> usize {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tenant.hash(&mut hasher);
+    (hasher.finish() as usize) % CAPPED_INSERT_LOCK_SHARDS
 }
 
 /// Interned tenant ID to avoid repeated string allocations.
@@ -247,6 +255,9 @@ pub struct Tree {
     root: NodeRef,
     /// Per-tenant character count for size tracking. Using TenantId for consistency.
     pub tenant_char_count: DashMap<TenantId, usize>,
+    /// Fixed lock stripes serialize capped admission for the same tenant without
+    /// retaining per-tenant synchronization state.
+    capped_insert_locks: [parking_lot::Mutex<()>; CAPPED_INSERT_LOCK_SHARDS],
 }
 
 // For the heap
@@ -356,6 +367,7 @@ impl Tree {
                 last_tenant: parking_lot::RwLock::new(None),
             }),
             tenant_char_count: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
+            capped_insert_locks: std::array::from_fn(|_| parking_lot::Mutex::new(())),
         }
     }
 
@@ -540,6 +552,7 @@ impl Tree {
         if max_chars == 0 {
             return false;
         }
+        let _capped_insert_lock = self.capped_insert_locks[capped_insert_lock_index(tenant)].lock();
         if let Some(count) = self.tenant_char_count.get(tenant) {
             if *count >= max_chars {
                 return false;
@@ -1014,6 +1027,7 @@ impl Tree {
 #[cfg(test)]
 mod tests {
     use std::{
+        sync::Barrier,
         thread,
         time::{Duration, Instant},
     };
@@ -1779,6 +1793,47 @@ mod tests {
         // After eviction frees space, inserts resume.
         tree.evict_tenant_by_size(50);
         assert!(tree.insert_capped("fresh-entry", "tenant1", max_chars));
+    }
+
+    #[test]
+    fn test_insert_capped_concurrent_budget() {
+        const MAX_CHARS: usize = 1;
+        const REQUEST_CHARS: usize = 10_000;
+        const WORKERS: usize = 32;
+
+        let tree = Arc::new(Tree::new());
+        let start = Arc::new(Barrier::new(WORKERS));
+        let mut workers = Vec::with_capacity(WORKERS);
+
+        for worker in 0..WORKERS {
+            let tree = Arc::clone(&tree);
+            let start = Arc::clone(&start);
+            workers.push(thread::spawn(move || {
+                let text = format!(
+                    "{}{}",
+                    char::from_u32(0x1000 + worker as u32).unwrap(),
+                    "x".repeat(REQUEST_CHARS - 1)
+                );
+                start.wait();
+                tree.insert_capped(&text, "tenant1", MAX_CHARS)
+            }));
+        }
+
+        let admitted = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|admitted| *admitted)
+            .count();
+        let stored = tree
+            .tenant_char_count
+            .get("tenant1")
+            .map(|count| *count)
+            .unwrap_or_default();
+
+        assert!(
+            stored <= MAX_CHARS + REQUEST_CHARS,
+            "concurrent inserts exceeded the one-request overshoot: {stored} chars from {admitted} admitted requests"
+        );
     }
 
     #[test]

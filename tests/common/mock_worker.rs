@@ -2,8 +2,9 @@
 #![allow(dead_code)]
 
 use axum::{
+    body::Body,
     extract::{Json, Path, State},
-    http::StatusCode,
+    http::{header::CONTENT_LENGTH, header::CONTENT_TYPE, HeaderValue, StatusCode},
     response::sse::{Event, KeepAlive},
     response::{IntoResponse, Response, Sse},
     routing::{get, post},
@@ -395,7 +396,28 @@ async fn chat_completions_handler(
     // Capture request for test inspection
     capture_request(config.port, "/v1/chat/completions", &headers);
 
+    let is_stream = payload
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     if should_fail(&config).await {
+        // A delayed streaming failure sends retryable headers but never yields
+        // a body chunk. This models an upstream that stalls after headers.
+        if is_stream && config.stream_chunk_delay_ms > 0 {
+            let mut response = Response::new(Body::from_stream(stream::pending::<
+                Result<bytes::Bytes, Infallible>,
+            >()));
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            response
+                .headers_mut()
+                .insert(CONTENT_LENGTH, HeaderValue::from_static("1"));
+            return response;
+        }
+
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
@@ -412,11 +434,6 @@ async fn chat_completions_handler(
     if config.response_delay_ms > 0 {
         tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
     }
-
-    let is_stream = payload
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -170,6 +170,47 @@ async fn test_retryable_failure_preserves_baseline_load() {
 }
 
 #[tokio::test]
+async fn test_retryable_streaming_headers_release_load_before_stalled_body() {
+    // A cache-aware streaming attempt that receives 500 headers must be
+    // cancelled before retrying, rather than retaining its load guard in a
+    // task blocked on the never-ending upstream body.
+    let ctx = TestContext::new(
+        MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 1.0,
+            stream_chunk_delay_ms: 1,
+        },
+        2,
+    )
+    .await;
+
+    let baseline = ctx.baseline_load();
+    let response = ctx.chat_request(true).await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .is_none(),
+        "an aborted upstream body must not retain its content-length"
+    );
+
+    let load = wait_for_load(&ctx, baseline, Duration::from_millis(250)).await;
+    assert_eq!(
+        load, baseline,
+        "retryable streaming attempts must release load without waiting for the body"
+    );
+
+    ctx.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_streaming_completion_releases_load_exactly_once() {
     // Slow stream with the literal `data: [DONE]` marker embedded in chunk
     // content. The load must stay held for the whole stream and be released

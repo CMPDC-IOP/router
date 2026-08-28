@@ -890,6 +890,19 @@ impl Router {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
+        if is_stream && is_retryable_status(status) {
+            // A retryable response is evaluated by RetryExecutor using only
+            // its status. Do not detach its body into a forwarding task: an
+            // upstream that stalls after headers would otherwise keep this
+            // attempt's load guard alive through the retry.
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            response_headers.remove(CONTENT_LENGTH);
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = status;
+            *response.headers_mut() = response_headers;
+            return response;
+        }
+
         if !is_stream {
             // For non-streaming requests, preserve headers
             let response_headers = header_utils::preserve_response_headers(res.headers());
