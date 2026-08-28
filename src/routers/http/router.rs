@@ -371,13 +371,20 @@ impl Router {
         }
     }
 
-    fn select_first_worker(&self) -> Result<String, String> {
-        let workers = self.worker_registry.get_all();
-        if workers.is_empty() {
-            Err("No workers are available".to_string())
-        } else {
-            Ok(workers[0].url().to_string())
-        }
+    /// Return one routable HTTP endpoint per physical worker host. DP-aware
+    /// workers are registered as `base_url@rank`, but control-plane GETs such
+    /// as `/v1/models` are served by the physical host rather than a rank.
+    fn available_worker_base_urls(&self) -> Vec<String> {
+        let mut urls: Vec<String> = self
+            .worker_registry
+            .get_all()
+            .into_iter()
+            .filter(|worker| worker.is_available())
+            .map(|worker| dp_utils::parse_worker_url(worker.url()).0)
+            .collect();
+        urls.sort_unstable();
+        urls.dedup();
+        urls
     }
 
     #[allow(dead_code)]
@@ -455,76 +462,116 @@ impl Router {
         response
     }
 
-    // Helper method to proxy GET requests to the first available worker
+    // Helper method to proxy GET requests with physical-host failover.
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
         let incoming_headers = req.headers();
         let headers = header_utils::copy_request_headers(&req);
+        let worker_urls = self.available_worker_base_urls();
+        if worker_urls.is_empty() {
+            return (StatusCode::SERVICE_UNAVAILABLE, "No workers are available").into_response();
+        }
 
-        match self.select_first_worker() {
-            Ok(worker_url) => {
-                let (base_url, dp_rank) = dp_utils::parse_worker_url(&worker_url);
-                let url = format!("{}/{}", base_url, endpoint);
-                let route_name = format!("/{}", endpoint);
-                let mut request_builder =
-                    dp_utils::add_dp_rank_header(self.client.get(&url), dp_rank);
+        let route_name = format!("/{}", endpoint);
+        let mut last_failure = None;
 
-                for (name, value) in headers {
-                    let name_lc = name.to_lowercase();
-                    // When the router selects a DP rank, it owns the
-                    // X-data-parallel-rank header: skip any client-supplied
-                    // value so the worker sees exactly one rank (ours).
-                    if name_lc != "content-type"
-                        && name_lc != "content-length"
-                        && !(dp_rank.is_some() && name_lc == "x-data-parallel-rank")
-                        && !header_utils::TRACE_HEADER_NAMES.contains(&name_lc.as_str())
-                    {
-                        request_builder = request_builder.header(name, value);
-                    }
-                }
-
-                match otel_http::send_client_request(
-                    request_builder,
-                    Some(incoming_headers),
-                    ClientRequestOptions {
-                        method: "GET",
-                        url: &url,
-                        route: Some(&route_name),
-                        request_phase: None,
-                    },
-                )
-                .await
+        for worker_url in worker_urls {
+            // `worker_url` comes from `available_worker_base_urls`, which
+            // strips any `@rank` suffix and deduplicates DP ranks, so it is
+            // always a physical host URL. When DP > 1, inject a rank header
+            // and drop any client-supplied X-data-parallel-rank so the worker
+            // sees exactly one router-selected rank.
+            let dp_rank = if self.intra_node_data_parallel_size > 1 {
+                Some(0_usize)
+            } else {
+                None
+            };
+            let url = format!("{}/{}", worker_url, endpoint);
+            let mut request_builder =
+                dp_utils::add_dp_rank_header(self.client.get(&url), dp_rank);
+            for (name, value) in &headers {
+                let name_lc = name.to_lowercase();
+                if name_lc != "content-type"
+                    && name_lc != "content-length"
+                    && !(dp_rank.is_some() && name_lc == "x-data-parallel-rank")
+                    && !header_utils::TRACE_HEADER_NAMES.contains(&name_lc.as_str())
                 {
-                    Ok(res) => {
-                        let status = StatusCode::from_u16(res.status().as_u16())
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-                        // Preserve headers from backend
-                        let response_headers =
-                            header_utils::preserve_response_headers(res.headers());
-
-                        match res.bytes().await {
-                            Ok(body) => {
-                                let mut response = Response::new(axum::body::Body::from(body));
-                                *response.status_mut() = status;
-                                *response.headers_mut() = response_headers;
-                                response
-                            }
-                            Err(e) => (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Failed to read response: {}", e),
-                            )
-                                .into_response(),
-                        }
-                    }
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Request failed: {}", e),
-                    )
-                        .into_response(),
+                    request_builder = request_builder.header(name, value);
                 }
             }
-            Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+
+            match otel_http::send_client_request(
+                request_builder,
+                Some(incoming_headers),
+                ClientRequestOptions {
+                    method: "GET",
+                    url: &url,
+                    route: Some(&route_name),
+                    request_phase: None,
+                },
+            )
+            .await
+            {
+                Ok(res) => {
+                    let status = StatusCode::from_u16(res.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let response_headers = header_utils::preserve_response_headers(res.headers());
+
+                    match res.bytes().await {
+                        Ok(body) => {
+                            let mut response = Response::new(axum::body::Body::from(body));
+                            *response.status_mut() = status;
+                            *response.headers_mut() = response_headers;
+
+                            if !is_retryable_status(status) {
+                                return response;
+                            }
+
+                            warn!(
+                                worker_url = %worker_url,
+                                endpoint,
+                                %status,
+                                "Control-plane GET failed; trying the next worker host"
+                            );
+                            last_failure = Some(response);
+                        }
+                        Err(e) => {
+                            warn!(
+                                worker_url = %worker_url,
+                                endpoint,
+                                error = %e,
+                                "Failed to read control-plane response; trying the next worker host"
+                            );
+                            last_failure = Some(
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("Failed to read response: {}", e),
+                                )
+                                    .into_response(),
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        worker_url = %worker_url,
+                        endpoint,
+                        error = %e,
+                        "Control-plane GET request failed; trying the next worker host"
+                    );
+                    last_failure = Some(
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Request failed: {}", e),
+                        )
+                            .into_response(),
+                    );
+                }
+            }
         }
+
+        last_failure.unwrap_or_else(|| {
+            (StatusCode::SERVICE_UNAVAILABLE, "No workers are available").into_response()
+        })
     }
 
     /// Convert axum HeaderMap to policy RequestHeaders (HashMap<String, String>)
@@ -1814,14 +1861,17 @@ mod tests {
     }
 
     #[test]
-    fn test_select_first_worker_regular() {
+    fn test_available_worker_base_urls_regular() {
         let router = create_test_regular_router();
-        let result = router.select_first_worker();
+        let urls = router.available_worker_base_urls();
 
-        assert!(result.is_ok());
-        let url = result.unwrap();
-        // DashMap doesn't guarantee order, so just check we get one of the workers
-        assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
+        assert_eq!(
+            urls,
+            vec![
+                "http://worker1:8080".to_string(),
+                "http://worker2:8080".to_string()
+            ]
+        );
     }
 
     #[tokio::test]
