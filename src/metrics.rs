@@ -81,9 +81,21 @@ pub fn init_metrics() {
     );
     describe_counter!("vllm_router_cache_hits_total", "Total cache hits");
     describe_counter!("vllm_router_cache_misses_total", "Total cache misses");
+    describe_histogram!(
+        "vllm_router_cache_match_rate",
+        "Prefix match rate observed by the cache-aware policy"
+    );
     describe_gauge!(
         "vllm_router_tree_size",
         "Current tree size for cache-aware routing"
+    );
+    describe_counter!(
+        "vllm_router_cache_stale_hits_total",
+        "Cache-affinity selections whose worker was missing or unhealthy"
+    );
+    describe_counter!(
+        "vllm_router_tree_cap_skipped_total",
+        "Tree updates skipped because the worker was at its max_tree_size budget"
     );
     describe_counter!(
         "vllm_router_load_balancing_events_total",
@@ -263,6 +275,9 @@ pub fn start_prometheus(config: PrometheusConfig) {
         60.0, 90.0, 120.0, 180.0, 240.0,
     ];
 
+    let rate_matcher = Matcher::Full(String::from("vllm_router_cache_match_rate"));
+    let rate_bucket = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+
     let ip_addr: IpAddr = config
         .host
         .parse()
@@ -274,6 +289,8 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .upkeep_timeout(Duration::from_secs(5 * 60))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
+        .set_buckets_for_metric(rate_matcher, &rate_bucket)
+        .expect("failed to set match-rate bucket")
         .install()
         .expect("failed to install Prometheus metrics exporter");
 }
@@ -370,11 +387,29 @@ impl RouterMetrics {
         counter!("vllm_router_cache_misses_total").increment(1);
     }
 
+    pub fn record_cache_match_rate(rate: f32) {
+        histogram!("vllm_router_cache_match_rate").record(rate.clamp(0.0, 1.0) as f64);
+    }
+
+    pub fn record_cache_stale_hit(worker: &str) {
+        counter!("vllm_router_cache_stale_hits_total",
+            "worker" => worker.to_string()
+        )
+        .increment(1);
+    }
+
     pub fn set_tree_size(worker: &str, size: usize) {
         gauge!("vllm_router_tree_size",
             "worker" => worker.to_string()
         )
         .set(size as f64);
+    }
+
+    pub fn record_tree_cap_skipped(worker: &str) {
+        counter!("vllm_router_tree_cap_skipped_total",
+            "worker" => worker.to_string()
+        )
+        .increment(1);
     }
 
     pub fn record_load_balancing_event() {
