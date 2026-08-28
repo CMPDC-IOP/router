@@ -26,6 +26,13 @@ struct TestContext {
 
 impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
+        Self::new_with_dp_size(worker_configs, 1).await
+    }
+
+    async fn new_with_dp_size(
+        worker_configs: Vec<MockWorkerConfig>,
+        intra_node_data_parallel_size: usize,
+    ) -> Self {
         // Create default router config
         let config = RouterConfig {
             mode: RoutingMode::Regular {
@@ -39,7 +46,7 @@ impl TestContext {
             worker_startup_timeout_secs: 10,
             worker_startup_check_interval_secs: 1,
             discovery: None,
-            intra_node_data_parallel_size: 1,
+            intra_node_data_parallel_size,
             api_key: None,
             api_key_validation_urls: vec![],
             metrics: None,
@@ -733,6 +740,85 @@ mod model_info_tests {
             Some("organization-owner")
         );
 
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_models_with_two_dp4_workers() {
+        let ctx = TestContext::new_with_dp_size(
+            vec![
+                MockWorkerConfig {
+                    port: 0,
+                    worker_type: WorkerType::Regular,
+                    health_status: HealthStatus::Healthy,
+                    response_delay_ms: 0,
+                    fail_rate: 0.0,
+                    stream_chunk_delay_ms: 0,
+                },
+                MockWorkerConfig {
+                    port: 0,
+                    worker_type: WorkerType::Regular,
+                    health_status: HealthStatus::Healthy,
+                    response_delay_ms: 0,
+                    fail_rate: 0.0,
+                    stream_chunk_delay_ms: 0,
+                },
+            ],
+            4,
+        )
+        .await;
+        let app = ctx.create_app().await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_models_falls_back_after_upstream_500() {
+        let ctx = TestContext::new(vec![
+            MockWorkerConfig {
+                port: 18391,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 1.0,
+                stream_chunk_delay_ms: 0,
+            },
+            MockWorkerConfig {
+                port: 18392,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
+            },
+        ])
+        .await;
+        let app = ctx.create_app().await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
         ctx.shutdown().await;
     }
 
