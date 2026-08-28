@@ -583,6 +583,7 @@ impl Drop for CacheAwarePolicy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
+    use crate::protocols::spec::{ChatCompletionRequest, GenerationRequest};
 
     #[test]
     fn test_cache_aware_with_balanced_load() {
@@ -741,6 +742,56 @@ mod tests {
         assert!(
             !text.contains("vllm_router_tree_cap_skipped_total 1"),
             "no skips expected with the default budget, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_cache_aware_learns_chat_requests_without_session_id() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "same prompt"}]
+        }))
+        .unwrap();
+        let routing_text = request.extract_text_for_routing();
+
+        let (policy, workers) = metrics::with_local_recorder(&recorder, || {
+            let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+                eviction_interval_secs: 0,
+                ..Default::default()
+            });
+            let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            ))];
+            policy.init_workers(&workers);
+
+            policy.select_worker(&workers, Some(&routing_text)).unwrap();
+            policy.select_worker(&workers, Some(&routing_text)).unwrap();
+
+            (policy, workers)
+        });
+
+        let text = handle.render();
+        assert!(
+            text.contains("vllm_router_cache_misses_total 1"),
+            "only the first request should miss, got: {text}"
+        );
+        assert!(
+            text.contains("vllm_router_cache_hits_total 1"),
+            "the repeated request should hit, got: {text}"
+        );
+        assert!(
+            text.contains("vllm_router_cache_match_rate_sum 1"),
+            "the repeated request should have a full prefix match, got: {text}"
+        );
+        assert_eq!(
+            policy
+                .get_tenant_char_counts(workers[0].model_id())
+                .get(workers[0].url())
+                .copied(),
+            Some(routing_text.chars().count())
         );
     }
 
