@@ -554,8 +554,10 @@ impl GenerationRequest for ChatCompletionRequest {
             }
         }
 
-        // Return empty string if no session_id - let routing policy handle this case
-        String::new()
+        // Without session affinity, route by the ordered chat history so
+        // repeated prompts can reuse the same worker's KV cache. Serializing
+        // the messages preserves role and content-part boundaries.
+        serde_json::to_string(&self.messages).unwrap_or_default()
     }
 }
 
@@ -3236,6 +3238,31 @@ mod tests {
         let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         assert!(request.model.is_none());
         assert_eq!(request.get_model(), None);
+    }
+
+    #[test]
+    fn test_chat_completion_without_session_id_has_routing_text() {
+        let json = r#"{
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        let routing_text = request.extract_text_for_routing();
+        assert!(!routing_text.is_empty());
+        assert!(routing_text.contains("Hello"));
+    }
+
+    #[test]
+    fn test_chat_completion_session_id_remains_routing_key() {
+        let json = r#"{
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "session_params": {"session_id": "session-123"}
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.extract_text_for_routing(), "session-123");
     }
 
     #[test]
