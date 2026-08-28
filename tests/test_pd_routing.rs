@@ -134,6 +134,11 @@ mod test_pd_routing {
             .unwrap(),
         );
         let router = RouterFactory::create_router(&context).await.unwrap();
+        let prefill_worker = context.worker_registry.get_prefill_workers()[0].clone();
+        let decode_worker = context.worker_registry.get_decode_workers()[0].clone();
+        // Unrelated in-flight requests must survive every handoff/error path.
+        prefill_worker.increment_load();
+        decode_worker.increment_load();
         for (model, stream, status) in [
             ("test", false, StatusCode::OK),
             ("test", true, StatusCode::OK),
@@ -176,6 +181,8 @@ mod test_pd_routing {
             let bytes = axum::body::to_bytes(response.into_body(), 4096)
                 .await
                 .unwrap();
+            assert_eq!(prefill_worker.load(), 1, "prefill load: model={model}");
+            assert_eq!(decode_worker.load(), 1, "decode load: model={model}");
             if stream {
                 assert!(String::from_utf8_lossy(&bytes).contains("[DONE]"));
             }
