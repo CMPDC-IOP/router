@@ -359,3 +359,7 @@ path = "tests/rust/load_tracking_test.rs"
 [[test]]
 name = "worker_startup_test"
 path = "tests/rust/worker_startup_test.rs"
+
+[[test]]
+name = "cache_memory_test"
+path = "tests/rust/cache_memory_test.rs"
