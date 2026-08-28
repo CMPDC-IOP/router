@@ -315,7 +315,10 @@ fn own_grpc_decode(response: Response, attempt: &PdAttempt) -> Response {
         .get::<crate::backend::grpc::GrpcStreamTask>()
         .is_some()
     {
-        hold_request_load_until_body_done(response, RequestLoadGuard::new(None, None))
+        attempt.hold_request_activity(hold_request_load_until_body_done(
+            response,
+            RequestLoadGuard::new(None, None),
+        ))
     } else {
         attempt.finish_decode();
         response
@@ -2028,6 +2031,7 @@ impl VllmPDRouter {
                 .unwrap_or(false);
         if is_streaming {
             finalize_decode_stream(decode_response, prefill_response_json, path)
+                .map(|response| attempt.hold_request_activity(response))
         } else {
             let status = decode_response.status();
             let headers = decode_response.headers().clone();
@@ -2051,6 +2055,7 @@ impl VllmPDRouter {
                     let mut headers = header_utils::preserve_response_headers(&headers);
                     headers.remove(http::header::CONTENT_LENGTH);
                     response_with_body(status, &headers, body)
+                        .map(|response| attempt.hold_request_activity(response))
                 }
             }
         }
@@ -6130,6 +6135,7 @@ mod tests {
             } else {
                 assert_eq!(first, "P");
             }
+            assert_eq!(ctx.request_metrics.running_count(), 1);
             let snapshot = router.pd_router.pd_load.snapshot();
             // A deployment whose handshake allows a late Decode choice holds
             // nothing on the Decode pool until Prefill returns.
@@ -6182,12 +6188,14 @@ mod tests {
             })
             .await
             .unwrap();
+            assert_eq!(ctx.request_metrics.running_count(), 1);
             gates.d.add_permits(1);
             let response = tokio::time::timeout(std::time::Duration::from_secs(5), request)
                 .await
                 .unwrap()
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(ctx.request_metrics.running_count(), 1);
             assert_eq!(
                 router
                     .pd_router
@@ -6201,6 +6209,7 @@ mod tests {
             );
             drop(response); // Covers the never-polled response-body path.
             assert!(router.pd_router.pd_load.snapshot().is_empty());
+            assert_eq!(ctx.request_metrics.running_count(), 0);
 
             gates.p.add_permits(1);
             let response = router
@@ -6214,6 +6223,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert_eq!(events.recv().await, Some("P"));
             assert!(router.pd_router.pd_load.snapshot().is_empty());
+            assert_eq!(ctx.request_metrics.running_count(), 0);
 
             // Aborting an admitted attempt during HTTP work releases both
             // reservations, without needing to receive any response headers.
@@ -6232,9 +6242,11 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            assert_eq!(ctx.request_metrics.running_count(), 1);
             cancelled.abort();
             assert!(cancelled.await.unwrap_err().is_cancelled());
             assert!(router.pd_router.pd_load.snapshot().is_empty());
+            assert_eq!(ctx.request_metrics.running_count(), 0);
             server.abort();
         }
     }
@@ -6433,6 +6445,7 @@ mod tests {
                 .unwrap(),
             Some("P")
         );
+        assert_eq!(ctx.request_metrics.running_count(), 1);
 
         // D0 leaves the pool while Prefill is still running.
         router.pd_router.remove_decode_server(&d0).await.unwrap();
@@ -6443,6 +6456,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(ctx.request_metrics.running_count(), 0);
+        assert!(router.pd_router.pd_load.snapshot().is_empty());
         assert!(
             d0_rx.try_recv().is_err(),
             "the pinned Decode is gone, so nothing else may serve the push"
