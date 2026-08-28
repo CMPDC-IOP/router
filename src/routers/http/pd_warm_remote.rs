@@ -1009,7 +1009,7 @@ pub(super) async fn execute(
             attempt.finish_decode();
             // The upstream error is forwarded unchanged; the body tracker
             // settles the Program turn as failed without publishing candidates.
-            Some(Ok((response, None)))
+            Some(Ok((attempt.hold_request_activity(response), None)))
         }
         Err(error) if route == PdPath::LocalAppend => {
             drop(local_permit);
@@ -1133,7 +1133,7 @@ pub(super) async fn execute(
                 ),
                 TurnResult::Forward(response) => {
                     attempt.finish_decode();
-                    (response, None)
+                    (attempt.hold_request_activity(response), None)
                 }
             }))
         }

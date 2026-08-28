@@ -10,7 +10,7 @@ use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
     RetryExecutor, Worker, WorkerRegistry, WorkerType,
 };
-use crate::metrics::RouterMetrics;
+use crate::metrics::{RequestActivity, RouterMetrics, RouterRequestMetrics};
 use crate::otel_http::{self, ClientRequestOptions};
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 use crate::policies::kv_aware_policy;
@@ -92,6 +92,59 @@ fn emit_http_first_sse<E>(
         Some(output_frame) => output_frame.send(tx, comment, false),
         None => tx.send(Ok(comment)).is_ok(),
     }
+}
+
+// Observe completion and optional timing without detaching the upstream stream.
+// Dropping the response also drops scheduling and request ownership immediately.
+fn observed_http_stream(
+    response: reqwest::Response,
+    completion: Option<ProgramCompletion>,
+    timing: Option<(Instant, f64)>,
+) -> Pin<Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>> {
+    Box::pin(futures_util::stream::unfold(
+        (response.bytes_stream(), completion, timing, None),
+        |(mut stream, completion, timing, pending)| async move {
+            if let Some(bytes) = pending {
+                return Some((Ok(bytes), (stream, completion, timing, None)));
+            }
+            match stream.next().await {
+                Some(Ok(bytes)) => {
+                    if let Some(completion) = &completion {
+                        completion.observe_sse_chunk(&bytes);
+                    }
+                    if let Some((start, ttfb)) = timing {
+                        let stages = http_stages_json(ttfb, start.elapsed().as_secs_f64() * 1000.0);
+                        info!(%stages, "http proxy stages");
+                        let comment = bytes::Bytes::from(format!(": router-stages {stages}\n\n"));
+                        Some((Ok(comment), (stream, completion, None, Some(bytes))))
+                    } else {
+                        Some((Ok(bytes), (stream, completion, None, None)))
+                    }
+                }
+                Some(Err(error)) => {
+                    if let Some(completion) = &completion {
+                        completion.finish(false);
+                    }
+                    Some((Err(error), (stream, None, None, None)))
+                }
+                None => {
+                    if let Some(completion) = &completion {
+                        completion.finish(true);
+                    }
+                    None
+                }
+            }
+        },
+    ))
+}
+
+// Logical activity follows the response body independently of backend load.
+fn hold_request_activity(response: Response, activity: RequestActivity) -> Response {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        Body::from_stream(super::guarded_stream(body.into_data_stream(), activity)),
+    )
 }
 
 struct LoadTrackedBody {
@@ -197,8 +250,10 @@ impl futures_util::Stream for LoadTrackedBody {
                 self.load.begin_decode();
             }
         }
-        if matches!(item, Poll::Ready(None)) {
+        if matches!(item, Poll::Ready(None | Some(Err(_)))) {
             self.release();
+        }
+        if matches!(item, Poll::Ready(None)) {
             self.producer_abort.take();
         }
         item
@@ -292,6 +347,7 @@ pub struct Router {
     kv_aware_session_affinity_ttl_secs: Option<u64>,
     health_config: HealthConfig,
     frontend: crate::backend::EngineFrontend,
+    request_metrics: RouterRequestMetrics,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     kv_index_supervisor: Option<Arc<crate::kv_index::KvIndexSupervisor>>,
@@ -651,6 +707,7 @@ impl Router {
                 .kv_aware_session_affinity_ttl_secs,
             health_config,
             frontend,
+            request_metrics: ctx.request_metrics.clone(),
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
             kv_index_supervisor,
@@ -1593,6 +1650,11 @@ impl Router {
         let completion = completion.as_ref();
         let cache_key = std::sync::OnceLock::new();
         let cache_key = &cache_key;
+        // Keep one logical activity alive across all retry attempts. It is
+        // marked only after a worker has actually been selected, so requests
+        // rejected before assignment never contribute to the running gauge.
+        let request_activity = self.request_metrics.begin_request();
+        let request_activity = &request_activity;
 
         let http_inputs = tokio::sync::OnceCell::new();
 
@@ -1764,6 +1826,8 @@ impl Router {
                     }
                 };
 
+                request_activity.mark_assigned();
+
                 if let Some(receipt) = &kv_receipt {
                     let input_tokens = match request_tokens {
                         KvRequestTokens::Shared(ids) => ids.map(<[u32]>::len),
@@ -1790,6 +1854,7 @@ impl Router {
                             prepared: (*prepared).clone(),
                         },
                         program_completion.clone(),
+                        request_activity.clone(),
                     )
                     .await;
 
@@ -1962,6 +2027,7 @@ impl Router {
         typed_req: &T,
         dispatch: TypedDispatch<'_>,
         program_completion: Option<ProgramCompletion>,
+        request_activity: RequestActivity,
     ) -> Response {
         let TypedDispatch {
             headers,
@@ -2005,6 +2071,7 @@ impl Router {
                 .await;
             if is_stream && response.status().is_success() {
                 response = hold_request_load_until_body_done(response, load);
+                response = hold_request_activity(response, request_activity);
             }
             if let Some(completion) = &program_completion {
                 completion.finish(response.status().is_success());
@@ -2125,7 +2192,7 @@ impl Router {
             let mut response = Response::new(Body::from_stream(res.bytes_stream()));
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
-            return response;
+            return hold_request_activity(response, request_activity);
         }
 
         if !is_stream {
@@ -2250,7 +2317,9 @@ impl Router {
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
-            hold_request_load_with_output_frame(response, load, Some(producer), output_frame)
+            let response =
+                hold_request_load_with_output_frame(response, load, Some(producer), output_frame);
+            hold_request_activity(response, request_activity)
         } else {
             // For requests without load tracking, just stream
             // Preserve headers for streaming response
@@ -2270,8 +2339,8 @@ impl Router {
                 None
             };
 
-            // Spawn task to forward stream
-            tokio::spawn(async move {
+            // Keep the producer cancellable when the client drops the body.
+            let producer = tokio::spawn(async move {
                 let mut stream = stream;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
@@ -2312,7 +2381,9 @@ impl Router {
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
-            response
+            let response =
+                hold_request_load_with_output_frame(response, load, Some(producer), None);
+            hold_request_activity(response, request_activity)
         }
     }
 
@@ -3341,6 +3412,15 @@ impl RouterTrait for Router {
             request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
         }
 
+        // Messages and EPD chat use the transparent path for inference.
+        let request_activity = (method == Method::POST
+            && matches!(path, "/v1/messages" | "/v1/chat/completions"))
+        .then(|| {
+            let activity = self.request_metrics.begin_request();
+            activity.mark_assigned();
+            activity
+        });
+
         // Send request
         let response = match otel_http::send_client_request(
             request_builder,
@@ -3383,9 +3463,12 @@ impl RouterTrait for Router {
                     }
                 }
 
-                if Self::should_proxy_transparent_directly(program_completion.is_some()) {
+                if Self::should_proxy_transparent_directly(load_tracked) {
                     response_builder
-                        .body(Body::from_stream(response.bytes_stream()))
+                        .body(Body::from_stream(super::guarded_stream(
+                            response.bytes_stream(),
+                            request_activity,
+                        )))
                         .unwrap_or_else(|error| {
                             (
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3393,10 +3476,7 @@ impl RouterTrait for Router {
                             )
                                 .into_response()
                         })
-                } else if Self::should_buffer_transparent_response(
-                    is_stream,
-                    program_completion.is_some(),
-                ) {
+                } else if Self::should_buffer_transparent_response(is_stream, load_tracked) {
                     match response.bytes().await {
                         Ok(bytes) => {
                             if status.is_success() {
@@ -3429,36 +3509,13 @@ impl RouterTrait for Router {
                         }
                     }
                 } else {
-                    let stream = response.bytes_stream();
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     let completion = status.is_success().then_some(program_completion).flatten();
-                    tokio::spawn(async move {
-                        let mut stream = stream;
-                        let mut stream_ok = true;
-                        while let Some(chunk) = stream.next().await {
-                            match chunk {
-                                Ok(bytes) => {
-                                    if let Some(completion) = &completion {
-                                        completion.observe_sse_chunk(&bytes);
-                                    }
-                                    if tx.send(Ok(bytes)).is_err() {
-                                        stream_ok = false;
-                                        break;
-                                    }
-                                }
-                                Err(error) => {
-                                    stream_ok = false;
-                                    let _ = tx.send(Err(format!("Stream error: {error}")));
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(completion) = completion {
-                            completion.finish(stream_ok);
-                        }
-                    });
+                    let stream = observed_http_stream(response, completion, None);
                     response_builder
-                        .body(Body::from_stream(UnboundedReceiverStream::new(rx)))
+                        .body(Body::from_stream(super::guarded_stream(
+                            stream,
+                            request_activity,
+                        )))
                         .unwrap_or_else(|error| {
                             (
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4723,6 +4780,7 @@ mod tests {
                     prepared: None,
                 },
                 None,
+                router.request_metrics.begin_request(),
             )
             .await;
         for response in [get_response, post_response] {
@@ -5474,6 +5532,7 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
+            request_metrics: RouterRequestMetrics::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             kv_index_supervisor: None,
@@ -5509,6 +5568,7 @@ mod tests {
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
             epd: None,
+            request_metrics: RouterRequestMetrics::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             kv_index_supervisor: None,
@@ -6126,6 +6186,7 @@ mod tests {
                     prepared: None,
                 },
                 None,
+                fixture.router.request_metrics.begin_request(),
             )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -6309,6 +6370,7 @@ mod tests {
                         prepared: None,
                     },
                     None,
+                    fixture.router.request_metrics.begin_request(),
                 )
                 .await;
             tokio::time::timeout(Duration::from_secs(5), fixture.requests.recv())
@@ -6448,6 +6510,36 @@ mod tests {
     #[tokio::test]
     async fn collection_health_checker_preserves_guarded_load() {
         check_health_preserves_guarded_load(false).await;
+    }
+
+    #[tokio::test]
+    async fn streaming_error_releases_worker_and_kv_load_before_body_drop() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://stream-error:8000".into(),
+            WorkerType::Regular,
+        ));
+        let manager = Arc::new(crate::policies::InMemorySlotManager::new());
+        let target = crate::kv_index::RoutableTarget {
+            instance_id: Arc::from("stream-error"),
+            dp_rank: 0,
+        };
+        worker.increment_load(); // An unrelated request must remain counted.
+        let load = admitted_kv_load(worker.clone(), manager.clone(), target.clone());
+        let stream = futures_util::stream::once(async {
+            Err::<bytes::Bytes, _>(std::io::Error::other("upstream body failed"))
+        });
+        let response =
+            hold_request_load_until_body_done(Response::new(Body::from_stream(stream)), load);
+        let mut body = response.into_body().into_data_stream();
+
+        assert!(body.next().await.unwrap().is_err());
+        assert_eq!(worker.load(), 1);
+        assert_eq!(
+            crate::policies::LoadProvider::sample(manager.as_ref(), &target),
+            crate::policies::LoadSample::default()
+        );
+        drop(body);
+        assert_eq!(worker.load(), 1);
     }
 
     #[tokio::test]
@@ -6952,6 +7044,7 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
+            request_metrics: RouterRequestMetrics::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             kv_index_supervisor: None,

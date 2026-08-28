@@ -3,7 +3,7 @@ use crate::{
     core::{WorkerRegistry, WorkerType},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
-    metrics::{self, PrometheusConfig},
+    metrics::{self, PrometheusConfig, PrometheusHandle, RouterRequestMetrics},
     middleware::{self, QueuedRequest, TokenBucket},
     policies::PolicyRegistry,
     protocols::{
@@ -21,7 +21,7 @@ use crate::{
 };
 use axum::{
     extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State},
-    http::StatusCode,
+    http::{header::CONTENT_TYPE, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     serve,
@@ -50,6 +50,7 @@ pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Arc<TokenBucket>,
+    pub request_metrics: RouterRequestMetrics,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
@@ -77,6 +78,7 @@ impl AppContext {
         }
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
+        let request_metrics = RouterRequestMetrics::new();
 
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new_with_affinity_ttl(
@@ -98,6 +100,7 @@ impl AppContext {
             client,
             router_config,
             rate_limiter,
+            request_metrics,
             worker_registry,
             policy_registry,
             router_manager,
@@ -114,6 +117,22 @@ pub struct AppState {
     pub context: Arc<AppContext>,
     pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
+    pub prometheus_handle: Option<PrometheusHandle>,
+}
+
+async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> Response {
+    match &state.prometheus_handle {
+        Some(handle) => (
+            [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            handle.render(),
+        )
+            .into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Prometheus metrics exporter is disabled",
+        )
+            .into_response(),
+    }
 }
 
 // Fallback handler for unmatched routes
@@ -913,6 +932,7 @@ pub fn build_app_with_wasm_middleware(
     ));
 
     let public_routes = Router::new()
+        .route("/metrics", get(prometheus_metrics))
         .route("/liveness", get(liveness))
         .route("/readiness", get(readiness))
         .route("/health", get(health))
@@ -1011,9 +1031,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Initialize prometheus metrics exporter
     println!("DEBUG: Initializing Prometheus metrics");
-    if let Some(prometheus_config) = config.prometheus_config {
-        metrics::start_prometheus(prometheus_config);
-    }
+    let prometheus_handle = config
+        .prometheus_config
+        .clone()
+        .map(metrics::start_prometheus);
     println!("DEBUG: Prometheus metrics initialized");
 
     info!(
@@ -1144,6 +1165,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         Duration::from_secs(config.router_config.queue_timeout_secs),
     );
 
+    if config.router_config.queue_size > 0 {
+        app_context.request_metrics.enable_waiting();
+    }
+
     // Start queue processor if enabled
     if let Some(processor) = processor {
         tokio::spawn(processor.run());
@@ -1159,6 +1184,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         context: app_context.clone(),
         concurrency_queue_tx: limiter.queue_tx.clone(),
         router_manager,
+        prometheus_handle,
     });
     let router_arc = Arc::clone(&app_state.router);
 
@@ -1509,6 +1535,7 @@ mod tests {
                 context,
                 concurrency_queue_tx: None,
                 router_manager: None,
+                prometheus_handle: None,
             }),
             128,
             Vec::new(),

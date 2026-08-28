@@ -1,4 +1,5 @@
 use crate::core::Worker;
+use crate::metrics::{RequestActivity, RouterRequestMetrics};
 use crate::policies::{AffinityKey, AffinityRecord, RequestHeaders};
 use axum::body::Body;
 use futures_util::StreamExt;
@@ -185,9 +186,25 @@ pub struct PdSelection {
 #[derive(Debug, Default)]
 pub struct PdLoadManager {
     loads: Arc<Mutex<Loads>>,
+    request_metrics: Option<RouterRequestMetrics>,
 }
 
 impl PdLoadManager {
+    pub(super) fn with_request_metrics(request_metrics: RouterRequestMetrics) -> Self {
+        Self {
+            request_metrics: Some(request_metrics),
+            ..Self::default()
+        }
+    }
+
+    fn begin_request(&self) -> Option<RequestActivity> {
+        self.request_metrics.as_ref().map(|metrics| {
+            let activity = metrics.begin_request();
+            activity.mark_assigned();
+            activity
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn snapshot(&self) -> Loads {
         self.loads.lock().clone()
@@ -260,6 +277,7 @@ impl PdLoadManager {
             prefill: selection.prefill.endpoint.clone(),
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
+            request_activity: Mutex::new(self.begin_request()),
             prefill_tokens: selection.prefill.new_prefill_tokens,
             state: Mutex::new(AttemptState {
                 prefill: true,
@@ -334,6 +352,7 @@ impl PdLoadManager {
             prefill,
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
+            request_activity: Mutex::new(self.begin_request()),
             prefill_tokens: None,
             state: Mutex::new(AttemptState {
                 prefill: true,
@@ -375,6 +394,9 @@ struct AttemptInner {
     prefill: PdEndpoint,
     prefill_worker: Mutex<Option<Arc<dyn Worker>>>,
     decode_worker: Mutex<Option<Arc<dyn Worker>>>,
+    /// Held during dispatch, then moved into the response body independently
+    /// of worker occupancy and producer completion.
+    request_activity: Mutex<Option<RequestActivity>>,
     prefill_tokens: Option<u64>,
     /// Guards every stage transition and the decode fields below, so a commit
     /// and a release cannot interleave halfway through.
@@ -552,11 +574,27 @@ impl PdAttempt {
         self.finish_decode();
     }
 
+    pub(super) fn hold_request_activity(
+        &self,
+        response: axum::response::Response,
+    ) -> axum::response::Response {
+        let Some(activity) = self.0.request_activity.lock().take() else {
+            return response;
+        };
+        let (parts, body) = response.into_parts();
+        axum::response::Response::from_parts(
+            parts,
+            Body::from_stream(super::guarded_stream(body.into_data_stream(), activity)),
+        )
+    }
+
     pub fn track_response(self, response: axum::response::Response) -> axum::response::Response {
         if self.0.state.lock().decode != DecodeState::Active {
             self.release();
+            drop(self.0.request_activity.lock().take());
             return response;
         }
+        let response = self.hold_request_activity(response);
         let (parts, body) = response.into_parts();
         axum::response::Response::from_parts(parts, self.track_body(body))
     }
