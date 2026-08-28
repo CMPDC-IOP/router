@@ -149,6 +149,9 @@ impl RetryExecutor {
                 return response;
             }
 
+            // Release the failed attempt's body and connection before waiting.
+            drop(response);
+
             // Backoff before next attempt
             let next_attempt = attempt + 1;
             // Compute delay based on the number of failures so far (0-indexed)
@@ -329,6 +332,51 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 3); // 2 fails + 1 success
         assert_eq!(backoffs.load(Ordering::Relaxed), 2);
         assert_eq!(exhausted.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_retry_drops_response_before_backoff() {
+        struct DropCounter(Arc<AtomicU32>);
+
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let dropped = Arc::new(AtomicU32::new(0));
+        let response = RetryExecutor::execute_response_with_retry(
+            &base_retry_config(),
+            |attempt| {
+                let guard = DropCounter(dropped.clone());
+                async move {
+                    if attempt > 0 {
+                        return (StatusCode::OK, "ok").into_response();
+                    }
+                    let stream = futures_util::stream::once(async move {
+                        let _guard = guard;
+                        std::future::pending::<Result<bytes::Bytes, std::convert::Infallible>>()
+                            .await
+                    });
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::body::Body::from_stream(stream),
+                    )
+                        .into_response()
+                }
+            },
+            |response, _| is_retryable_status(response.status()),
+            |_, _| {
+                assert_eq!(
+                    dropped.load(Ordering::Relaxed),
+                    1,
+                    "retry backoff must not keep the failed attempt's body alive"
+                );
+            },
+            || panic!("second attempt should succeed"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
