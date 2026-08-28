@@ -345,6 +345,7 @@ mod dp_e2e_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let worker_url = worker.start().await.unwrap();
         let port: u16 = worker_url.split(':').next_back().unwrap().parse().unwrap();
@@ -717,6 +718,7 @@ mod dp_e2e_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let mut decode_worker = MockWorker::new(MockWorkerConfig {
             port: 0,
@@ -724,6 +726,7 @@ mod dp_e2e_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let prefill_url = prefill_worker.start().await.unwrap();
         let decode_url = decode_worker.start().await.unwrap();
@@ -789,6 +792,7 @@ mod dp_e2e_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let mut initial_decode = MockWorker::new(MockWorkerConfig {
             port: 0,
@@ -796,6 +800,7 @@ mod dp_e2e_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let prefill_url = initial_prefill.start().await.unwrap();
         let decode_url = initial_decode.start().await.unwrap();
@@ -807,6 +812,7 @@ mod dp_e2e_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let new_prefill_url = new_prefill.start().await.unwrap();
 
@@ -883,6 +889,7 @@ mod dp_e2e_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let mut initial_decode = MockWorker::new(MockWorkerConfig {
             port: 0,
@@ -890,6 +897,7 @@ mod dp_e2e_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let prefill_url = initial_prefill.start().await.unwrap();
         let decode_url = initial_decode.start().await.unwrap();
@@ -901,6 +909,7 @@ mod dp_e2e_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let new_decode_url = new_decode.start().await.unwrap();
 
@@ -958,6 +967,7 @@ mod dp_e2e_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let mut initial_decode = MockWorker::new(MockWorkerConfig {
             port: 0,
@@ -965,6 +975,7 @@ mod dp_e2e_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let prefill_url = initial_prefill.start().await.unwrap();
         let decode_url = initial_decode.start().await.unwrap();
@@ -975,6 +986,7 @@ mod dp_e2e_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let new_prefill_url = new_prefill.start().await.unwrap();
 
@@ -1023,6 +1035,7 @@ mod dp_e2e_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let mut decode_worker = MockWorker::new(MockWorkerConfig {
             port: 0,
@@ -1030,6 +1043,7 @@ mod dp_e2e_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let prefill_url = prefill_worker.start().await.unwrap();
         let decode_url = decode_worker.start().await.unwrap();
