@@ -2,6 +2,7 @@
 
 use crate::config::CircuitBreakerConfig;
 use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
+use crate::metrics::RouterRequestMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, GenerateRequest, InferenceGenerateRequest,
@@ -31,6 +32,8 @@ pub struct OpenAIRouter {
     circuit_breaker: CircuitBreaker,
     /// Health status
     healthy: AtomicBool,
+    /// Router-wide logical request activity accounting.
+    request_metrics: RouterRequestMetrics,
 }
 
 impl OpenAIRouter {
@@ -38,6 +41,19 @@ impl OpenAIRouter {
     pub async fn new(
         base_url: String,
         circuit_breaker_config: Option<CircuitBreakerConfig>,
+    ) -> Result<Self, String> {
+        Self::new_with_request_metrics(
+            base_url,
+            circuit_breaker_config,
+            RouterRequestMetrics::new(),
+        )
+        .await
+    }
+
+    pub async fn new_with_request_metrics(
+        base_url: String,
+        circuit_breaker_config: Option<CircuitBreakerConfig>,
+        request_metrics: RouterRequestMetrics,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
@@ -63,6 +79,7 @@ impl OpenAIRouter {
             base_url,
             circuit_breaker,
             healthy: AtomicBool::new(true),
+            request_metrics,
         })
     }
 }
@@ -283,6 +300,8 @@ impl super::super::RouterTrait for OpenAIRouter {
             req = req.header("Accept", "text/event-stream");
         }
 
+        let request_activity = self.request_metrics.begin_request();
+        request_activity.mark_assigned();
         let resp = match otel_http::send_client_request(
             req,
             headers,
@@ -332,28 +351,15 @@ impl super::super::RouterTrait for OpenAIRouter {
                 }
             }
         } else {
-            // Stream SSE bytes to client
-            let stream = resp.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            tokio::spawn(async move {
-                let mut s = stream;
-                while let Some(chunk) = s.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-            });
-            let mut response = Response::new(Body::from_stream(
-                tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
-            ));
+            // Keep logical ownership in the body stream so completion, error,
+            // or downstream disconnect releases the request exactly once.
+            let stream = resp
+                .bytes_stream()
+                .map(|item| item.map_err(|e| format!("Stream error: {}", e)));
+            let mut response = Response::new(Body::from_stream(super::guarded_stream(
+                stream,
+                request_activity,
+            )));
             *response.status_mut() = status;
             response
                 .headers_mut()

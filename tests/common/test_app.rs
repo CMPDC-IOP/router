@@ -57,6 +57,7 @@ pub fn create_test_app_with_wasm(
         context: app_context,
         concurrency_queue_tx: None,
         router_manager: None,
+        prometheus_handle: None,
     });
 
     // Configure request ID headers (use defaults if not specified)

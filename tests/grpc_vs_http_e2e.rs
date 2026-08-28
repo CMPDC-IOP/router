@@ -379,3 +379,41 @@ async fn grpc_stream_emits_openai_compatible_usage_chunk() {
         .all(|chunk| chunk.get("usage").is_none() || chunk["usage"].is_null()));
     assert!(text.contains("data: [DONE]"));
 }
+
+#[tokio::test]
+async fn grpc_stream_request_metrics_follow_body_completion_and_drop() {
+    let grpc = MockVllmRsServer::spawn().await;
+    let config = test_config(vec![grpc.grpc_url.clone()]);
+    let ctx = create_test_context(config.clone());
+    let router = Router::new(vec![grpc.grpc_url.clone()], &ctx)
+        .await
+        .unwrap();
+    router.pin_test_token_ids(vec![1, 2, 3]);
+    let app = create_test_app(Arc::new(router), reqwest::Client::new(), &config);
+    for consume in [true, false] {
+        let mut request: serde_json::Value = serde_json::from_str(CHAT_BODY).unwrap();
+        request["stream"] = json!(true);
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(ctx.request_metrics.running_count(), 1);
+        if consume {
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        } else {
+            drop(response);
+        }
+        assert_eq!(ctx.request_metrics.running_count(), 0);
+    }
+}

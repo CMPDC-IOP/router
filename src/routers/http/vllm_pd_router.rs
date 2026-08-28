@@ -7,7 +7,7 @@ use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
 use crate::core::{BasicWorker, Worker, WorkerLoadGuard, WorkerType};
-use crate::metrics::RouterMetrics;
+use crate::metrics::{RequestActivity, RouterMetrics, RouterRequestMetrics};
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::PolicyRegistry;
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
@@ -63,6 +63,8 @@ pub struct VllmPDRouter {
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
     /// NIXL push identity per prefill base_url and dp_rank; never held across an await.
     nixl_prefill_info: RwLock<HashMap<String, HashMap<usize, Value>>>,
+    /// Router-wide logical request activity accounting.
+    request_metrics: RouterRequestMetrics,
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -774,6 +776,8 @@ impl VllmPDRouter {
     async fn handle_decode_response(
         &self,
         decode_response: reqwest::Response,
+        decode_load_guard: Option<WorkerLoadGuard>,
+        request_activity: RequestActivity,
         prefill_response_json: Option<&Value>,
         path: &str,
         prefill_http: &str,
@@ -850,7 +854,10 @@ impl VllmPDRouter {
             for (name, value) in decode_headers.iter() {
                 response_builder = response_builder.header(name, value);
             }
-            let body = axum::body::Body::from_stream(decode_response.bytes_stream());
+            let body = Body::from_stream(super::guarded_stream(
+                decode_response.bytes_stream(),
+                (decode_load_guard, request_activity),
+            ));
             return response_builder.body(body).map_err(|e| {
                 format!(
                     "Failed to build streaming response from {}: {}",
@@ -885,6 +892,7 @@ impl VllmPDRouter {
     ) -> Result<Response, String> {
         let (prefill_http, prefill_zmq) = prefill_instance;
         let (decode_http, decode_zmq) = decode_instance;
+        let request_activity = self.request_metrics.begin_request();
 
         debug!("ENTERED process_vllm_two_stage_request_discovered method");
         let start_time = Instant::now();
@@ -968,6 +976,7 @@ impl VllmPDRouter {
             self.start_profiling(&format!("http://{}", prefill_base_http))
                 .await;
 
+            request_activity.mark_assigned();
             let prefill_response = match otel_http::send_client_request(
                 build_prefill_request_builder(
                     &self.http_client,
@@ -1174,6 +1183,7 @@ impl VllmPDRouter {
                     request_phase: Some("decode"),
                 },
             );
+            request_activity.mark_assigned();
             let (prefill_result, decode_result) = tokio::join!(prefill_fut, decode_fut);
             let concurrent_prefill_response_json: Option<Value> = match prefill_result {
                 Err(prefill_err) => {
@@ -1218,6 +1228,8 @@ impl VllmPDRouter {
             return self
                 .handle_decode_response(
                     decode_response,
+                    None,
+                    request_activity,
                     concurrent_prefill_response_json.as_ref(),
                     path,
                     prefill_http,
@@ -1259,6 +1271,8 @@ impl VllmPDRouter {
 
         self.handle_decode_response(
             decode_response,
+            None,
+            request_activity,
             prefill_response_json.as_ref(),
             path,
             prefill_http,
@@ -1286,6 +1300,7 @@ impl VllmPDRouter {
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
+        let request_activity = self.request_metrics.begin_request();
 
         if let Some((prefill_request, decode_request, request_id)) = self
             .try_build_concurrent_requests(&original_request, &prefill_worker, &decode_worker, path)
@@ -1301,6 +1316,7 @@ impl VllmPDRouter {
                     path,
                     headers,
                     start_time,
+                    request_activity,
                 )
                 .await;
         }
@@ -1396,6 +1412,7 @@ impl VllmPDRouter {
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
+        request_activity.mark_assigned();
         let prefill_response = match otel_http::send_client_request(
             prefill_request_builder.json(&prefill_request),
             headers,
@@ -1576,9 +1593,6 @@ impl VllmPDRouter {
         // Stop profiling on decode server after response received
         self.stop_profiling(&decode_base_url).await;
 
-        // Decode phase complete: release decode load
-        decode_load_guard.release();
-
         let status = decode_response.status();
         let headers = decode_response.headers().clone();
 
@@ -1670,7 +1684,10 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = Body::from_stream(decode_response.bytes_stream());
+            let body = Body::from_stream(super::guarded_stream(
+                decode_response.bytes_stream(),
+                (Some(decode_load_guard), request_activity),
+            ));
             response_builder
                 .body(body)
                 .map_err(|e| PDRouterError::NetworkError {
@@ -1723,6 +1740,7 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
         start_time: Instant,
+        request_activity: RequestActivity,
     ) -> Result<Response, PDRouterError> {
         let prefill_base_url = prefill_worker.base_url().to_string();
         let prefill_dp_rank = prefill_worker.dp_rank();
@@ -1746,11 +1764,15 @@ impl VllmPDRouter {
             )
         };
 
-        prefill_worker.increment_load();
-        decode_worker.increment_load();
+        // Both stages are already assigned before concurrent dispatch starts.
+        // Their guards keep per-worker load correct across any cancellation or
+        // error path; the decode guard moves into a successful stream below.
+        let prefill_load_guard = WorkerLoadGuard::new(prefill_worker.clone());
+        let decode_load_guard = WorkerLoadGuard::new(decode_worker.clone());
         self.start_profiling(&prefill_base_url).await;
         self.start_profiling(&decode_base_url).await;
 
+        request_activity.mark_assigned();
         let (prefill_result, decode_result) = tokio::join!(
             otel_http::send_client_request(
                 stage_builder(&prefill_url, prefill_dp_rank).json(&prefill_request),
@@ -1774,7 +1796,6 @@ impl VllmPDRouter {
             ),
         );
 
-        prefill_worker.decrement_load();
         self.stop_profiling(&prefill_base_url).await;
 
         let prefill_response_json = match prefill_result {
@@ -1784,7 +1805,6 @@ impl VllmPDRouter {
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok()),
             Ok(resp) => {
-                decode_worker.decrement_load();
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1798,7 +1818,6 @@ impl VllmPDRouter {
                 });
             }
             Err(e) => {
-                decode_worker.decrement_load();
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1812,6 +1831,7 @@ impl VllmPDRouter {
                 });
             }
         };
+        prefill_load_guard.release();
         if let Some(prefill_json) = prefill_response_json.as_ref() {
             self.maybe_cache_nixl_push_identity(&prefill_base_url, prefill_dp_rank, prefill_json);
         }
@@ -1819,7 +1839,6 @@ impl VllmPDRouter {
         let decode_response = match decode_result {
             Ok(resp) => resp,
             Err(e) => {
-                decode_worker.decrement_load();
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1834,8 +1853,6 @@ impl VllmPDRouter {
                 });
             }
         };
-        decode_worker.decrement_load();
-
         let needs_logprobs = decode_request.get("logprobs").is_some()
             || decode_request
                 .get("echo")
@@ -1854,6 +1871,8 @@ impl VllmPDRouter {
 
         self.handle_decode_response(
             decode_response,
+            Some(decode_load_guard),
+            request_activity,
             prefill_response_json.as_ref(),
             path,
             prefill_http,
@@ -1918,6 +1937,7 @@ impl VllmPDRouter {
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
+                request_metrics: ctx.request_metrics.clone(),
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -2008,6 +2028,7 @@ impl VllmPDRouter {
                 kv_connector,
                 mooncake_prefill_info,
                 nixl_prefill_info: RwLock::new(HashMap::new()),
+                request_metrics: ctx.request_metrics.clone(),
             })
         }
     }

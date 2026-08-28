@@ -170,6 +170,21 @@ vllm-router --api-key-validation-urls https://codebase.helmholtz.cloud/api/v4/us
 
 Prometheus metrics endpoint available at `127.0.0.1:29000` by default.
 
+When Prometheus is enabled, the main router port also serves `/metrics`.
+The vLLM-compatible metric names describe router-side activity:
+
+- `vllm:num_requests_running`: logical inference requests assigned to a worker
+  and not yet completed, including backend waiting and retry backoff. Streaming
+  requests remain counted until their response stream ends or is dropped.
+  Regular routing includes `POST /v1/messages`; arbitrary transparent proxy
+  requests are excluded.
+- `vllm:num_requests_waiting`: requests waiting in the router admission queue,
+  exposed only when that queue is enabled. It does not include backend queues.
+  The transparent `/v1/messages` fallback does not use this admission queue.
+
+These are router-wide gauges without model or worker labels, not measurements
+of GPU execution or backend scheduler occupancy.
+
 ```bash
 # Custom metrics configuration
 vllm-router \
