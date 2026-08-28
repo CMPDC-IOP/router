@@ -3,7 +3,7 @@ use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
     RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
 };
-use crate::metrics::RouterMetrics;
+use crate::metrics::{RequestActivity, RouterMetrics, RouterRequestMetrics};
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
@@ -28,7 +28,6 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 
 /// Regular router that uses injected load balancing policies
@@ -43,6 +42,7 @@ pub struct Router {
     api_key: Option<String>,
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
+    request_metrics: RouterRequestMetrics,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
@@ -202,6 +202,7 @@ impl Router {
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
+            request_metrics: ctx.request_metrics.clone(),
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
         })
@@ -635,55 +636,73 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
+        // Keep one logical activity alive across all retry attempts. It is
+        // marked only after a worker has actually been selected, so requests
+        // rejected before assignment never contribute to the running gauge.
+        let request_activity = self.request_metrics.begin_request();
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
-            |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
-                    Some(w) => w,
-                    None => {
-                        RouterMetrics::record_request_error(route, "no_available_workers");
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "No available workers (all circuits open or unhealthy)",
-                        )
-                            .into_response();
+            {
+                let request_activity = request_activity.clone();
+                move |_: u32| {
+                    let request_activity = request_activity.clone();
+                    let text = text.clone();
+                    async move {
+                        let worker =
+                            match self.select_worker_for_model(model_id, Some(&text), headers) {
+                                Some(w) => w,
+                                None => {
+                                    RouterMetrics::record_request_error(
+                                        route,
+                                        "no_available_workers",
+                                    );
+                                    return (
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        "No available workers (all circuits open or unhealthy)",
+                                    )
+                                        .into_response();
+                                }
+                            };
+
+                        request_activity.mark_assigned();
+
+                        // Optional load tracking for the cache-aware policy. The RAII
+                        // guard owns the count for this attempt: it is released exactly
+                        // once on drop (failures, retries) or when the stream-forwarding
+                        // task finishes (streaming), so cancellation cannot leak it.
+                        let policy = match model_id {
+                            Some(model) => self.policy_registry.get_policy_or_default(model),
+                            None => self.policy_registry.get_default_policy(),
+                        };
+
+                        let load_guard = if policy.name() == "cache_aware" {
+                            Some(WorkerLoadGuard::new(worker.clone()))
+                        } else {
+                            None
+                        };
+
+                        let response = self
+                            .send_typed_request(
+                                headers,
+                                typed_req,
+                                route,
+                                worker.url(),
+                                is_stream,
+                                load_guard,
+                                request_activity.clone(),
+                            )
+                            .await;
+
+                        // Client errors (4xx) are not worker failures - only server errors (5xx)
+                        // should count against the circuit breaker.
+                        let status = response.status();
+                        worker.record_outcome(status.is_success() || status.is_client_error());
+
+                        response
                     }
-                };
-
-                // Optional load tracking for the cache-aware policy. The RAII
-                // guard owns the count for this attempt: it is released exactly
-                // once on drop (failures, retries) or when the stream-forwarding
-                // task finishes (streaming), so cancellation cannot leak it.
-                let policy = match model_id {
-                    Some(model) => self.policy_registry.get_policy_or_default(model),
-                    None => self.policy_registry.get_default_policy(),
-                };
-
-                let load_guard = if policy.name() == "cache_aware" {
-                    Some(WorkerLoadGuard::new(worker.clone()))
-                } else {
-                    None
-                };
-
-                let response = self
-                    .send_typed_request(
-                        headers,
-                        typed_req,
-                        route,
-                        worker.url(),
-                        is_stream,
-                        load_guard,
-                    )
-                    .await;
-
-                // Client errors (4xx) are not worker failures - only server errors (5xx)
-                // should count against the circuit breaker.
-                let status = response.status();
-                worker.record_outcome(status.is_success() || status.is_client_error());
-
-                response
+                }
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
@@ -833,6 +852,7 @@ impl Router {
     }
 
     // Send typed request directly without conversion
+    #[allow(clippy::too_many_arguments)]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -841,6 +861,7 @@ impl Router {
         worker_url: &str,
         is_stream: bool,
         load_guard: Option<WorkerLoadGuard>, // RAII load tracking for this attempt
+        request_activity: RequestActivity,
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -971,76 +992,21 @@ impl Router {
             // The response body has been fully read, so this attempt is done:
             // `load_guard` drops at scope exit, releasing the load count once.
             response
-        } else if let Some(guard) = load_guard {
-            // For streaming with load tracking, move the guard into the
-            // forwarding task so the count lives exactly as long as the stream.
-            // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward the stream; `guard` drops when it ends,
-            // covering normal completion, upstream errors and client
-            // disconnects (send fails once the receiver is dropped).
-            tokio::spawn(async move {
-                let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-                // `guard` is dropped here, releasing the load count exactly once.
-                drop(guard);
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-            response
         } else {
-            // For requests without load tracking, just stream
-            // Preserve headers for streaming response
+            // Keep request activity and optional per-worker load ownership in
+            // the response body stream. Dropping the body drops this state
+            // immediately, including on downstream disconnect.
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward stream
-            tokio::spawn(async move {
-                let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
+            let stream = res
+                .bytes_stream()
+                .map(|item| item.map_err(|e| format!("Stream error: {}", e)));
+            let body = Body::from_stream(super::guarded_stream(
+                stream,
+                (load_guard, request_activity),
+            ));
 
             let mut response = Response::new(body);
             *response.status_mut() = status;
@@ -1845,6 +1811,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            request_metrics: RouterRequestMetrics::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
         }
@@ -1920,6 +1887,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            request_metrics: RouterRequestMetrics::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
         }

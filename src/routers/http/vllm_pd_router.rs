@@ -7,7 +7,7 @@ use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
 use crate::core::{BasicWorker, Worker, WorkerLoadGuard, WorkerType};
-use crate::metrics::RouterMetrics;
+use crate::metrics::{RequestActivity, RouterMetrics, RouterRequestMetrics};
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::PolicyRegistry;
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
@@ -61,6 +61,8 @@ pub struct VllmPDRouter {
     kv_connector: KvConnector,
     /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
+    /// Router-wide logical request activity accounting.
+    request_metrics: RouterRequestMetrics,
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -667,6 +669,7 @@ impl VllmPDRouter {
     async fn handle_decode_response(
         &self,
         decode_response: reqwest::Response,
+        request_activity: RequestActivity,
         prefill_response_json: Option<&Value>,
         path: &str,
         prefill_http: &str,
@@ -743,7 +746,10 @@ impl VllmPDRouter {
             for (name, value) in decode_headers.iter() {
                 response_builder = response_builder.header(name, value);
             }
-            let body = axum::body::Body::from_stream(decode_response.bytes_stream());
+            let body = Body::from_stream(super::guarded_stream(
+                decode_response.bytes_stream(),
+                request_activity,
+            ));
             return response_builder.body(body).map_err(|e| {
                 format!(
                     "Failed to build streaming response from {}: {}",
@@ -778,6 +784,7 @@ impl VllmPDRouter {
     ) -> Result<Response, String> {
         let (prefill_http, prefill_zmq) = prefill_instance;
         let (decode_http, decode_zmq) = decode_instance;
+        let request_activity = self.request_metrics.begin_request();
 
         debug!("ENTERED process_vllm_two_stage_request_discovered method");
         let start_time = Instant::now();
@@ -856,6 +863,7 @@ impl VllmPDRouter {
             self.start_profiling(&format!("http://{}", prefill_base_http))
                 .await;
 
+            request_activity.mark_assigned();
             let prefill_response = match otel_http::send_client_request(
                 build_prefill_request_builder(
                     &self.http_client,
@@ -1062,6 +1070,7 @@ impl VllmPDRouter {
                     request_phase: Some("decode"),
                 },
             );
+            request_activity.mark_assigned();
             let (prefill_result, decode_result) = tokio::join!(prefill_fut, decode_fut);
             let concurrent_prefill_response_json: Option<Value> = match prefill_result {
                 Err(prefill_err) => {
@@ -1099,6 +1108,7 @@ impl VllmPDRouter {
             return self
                 .handle_decode_response(
                     decode_response,
+                    request_activity,
                     concurrent_prefill_response_json.as_ref(),
                     path,
                     prefill_http,
@@ -1140,6 +1150,7 @@ impl VllmPDRouter {
 
         self.handle_decode_response(
             decode_response,
+            request_activity,
             prefill_response_json.as_ref(),
             path,
             prefill_http,
@@ -1167,6 +1178,7 @@ impl VllmPDRouter {
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
+        let request_activity = self.request_metrics.begin_request();
         debug!(
             "Prefill worker: {}, Decode worker: {}, Path: {}",
             prefill_worker.url(),
@@ -1258,6 +1270,7 @@ impl VllmPDRouter {
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
+        request_activity.mark_assigned();
         let prefill_response = match otel_http::send_client_request(
             prefill_request_builder.json(&prefill_request),
             headers,
@@ -1563,7 +1576,10 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = Body::from_stream(decode_response.bytes_stream());
+            let body = Body::from_stream(super::guarded_stream(
+                decode_response.bytes_stream(),
+                request_activity,
+            ));
             response_builder
                 .body(body)
                 .map_err(|e| PDRouterError::NetworkError {
@@ -1622,6 +1638,7 @@ impl VllmPDRouter {
                 prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
+                request_metrics: ctx.request_metrics.clone(),
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -1711,6 +1728,7 @@ impl VllmPDRouter {
                 prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
                 mooncake_prefill_info,
+                request_metrics: ctx.request_metrics.clone(),
             })
         }
     }
