@@ -82,6 +82,7 @@ mod sticky_least_loaded_pd_tests {
                     health_status: HealthStatus::Healthy,
                     response_delay_ms: 0,
                     fail_rate: 0.0,
+                    stream_chunk_delay_ms: 0,
                 });
                 let url = worker.start().await.unwrap();
                 clear_captured_requests(port_of(&url));
