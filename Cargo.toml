@@ -111,6 +111,7 @@ portpicker = "0.1"
 tempfile = "3.8"
 lazy_static = "1.4"
 opentelemetry_sdk = { version = "0.27", features = ["testing"] }
+prometheus-scraper = { version = "0.2", default-features = false }
 
 [[bench]]
 name = "request_processing"

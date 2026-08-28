@@ -4,7 +4,7 @@ use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
     RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
 };
-use crate::metrics::RouterMetrics;
+use crate::metrics::{RequestActivity, RouterMetrics, RouterRequestMetrics};
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::program_scheduling::{
@@ -37,7 +37,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 
 fn insert_router_stages(headers: &mut HeaderMap, stages: &serde_json::Value) {
@@ -59,13 +58,48 @@ fn http_stages_json(http_ttfb_ms: f64, first_sse_ms: f64) -> serde_json::Value {
     })
 }
 
-fn emit_http_first_sse<E>(
-    tx: &tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, E>>,
-    stages: &serde_json::Value,
-) {
-    let comment = format!(": router-stages {stages}\n\n");
-    info!(%stages, "http proxy stages");
-    let _ = tx.send(Ok(bytes::Bytes::from(comment)));
+// Observe completion and optional timing without detaching the upstream stream.
+// Dropping the response also drops scheduling and request ownership immediately.
+fn observed_http_stream(
+    response: reqwest::Response,
+    completion: Option<ProgramCompletion>,
+    timing: Option<(Instant, f64)>,
+) -> Pin<Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>> {
+    Box::pin(futures_util::stream::unfold(
+        (response.bytes_stream(), completion, timing, None),
+        |(mut stream, completion, timing, pending)| async move {
+            if let Some(bytes) = pending {
+                return Some((Ok(bytes), (stream, completion, timing, None)));
+            }
+            match stream.next().await {
+                Some(Ok(bytes)) => {
+                    if let Some(completion) = &completion {
+                        completion.observe_sse_chunk(&bytes);
+                    }
+                    if let Some((start, ttfb)) = timing {
+                        let stages = http_stages_json(ttfb, start.elapsed().as_secs_f64() * 1000.0);
+                        info!(%stages, "http proxy stages");
+                        let comment = bytes::Bytes::from(format!(": router-stages {stages}\n\n"));
+                        Some((Ok(comment), (stream, completion, None, Some(bytes))))
+                    } else {
+                        Some((Ok(bytes), (stream, completion, None, None)))
+                    }
+                }
+                Some(Err(error)) => {
+                    if let Some(completion) = &completion {
+                        completion.finish(false);
+                    }
+                    Some((Err(error), (stream, None, None, None)))
+                }
+                None => {
+                    if let Some(completion) = &completion {
+                        completion.finish(true);
+                    }
+                    None
+                }
+            }
+        },
+    ))
 }
 
 struct LoadTrackedBody {
@@ -151,6 +185,7 @@ pub struct Router {
     circuit_breaker_config: CircuitBreakerConfig,
     health_config: HealthConfig,
     frontend: crate::backend::EngineFrontend,
+    request_metrics: RouterRequestMetrics,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     program_scheduler: Option<Arc<ProgramScheduler>>,
@@ -379,6 +414,7 @@ impl Router {
             frontend: crate::backend::EngineFrontend::with_request_timeout(Duration::from_secs(
                 ctx.router_config.request_timeout_secs,
             )),
+            request_metrics: ctx.request_metrics.clone(),
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
             program_scheduler,
@@ -782,7 +818,8 @@ impl Router {
                 let check_health = tokio::spawn(async move {
                     let reason = if crate::backend::is_grpc_url(&url_clone) {
                         crate::backend::check_grpc_health(&url_clone, Duration::from_secs(2))
-                            .await.err()
+                            .await
+                            .err()
                     } else {
                         let health_url = format!("{}/health", url_clone);
                         match client_clone.get(&health_url).send().await {
@@ -841,6 +878,15 @@ impl Router {
     /// Return one routable HTTP endpoint per physical worker host. DP-aware
     /// workers are registered as `base_url@rank`, but control-plane GETs such
     /// as `/v1/models` are served by the physical host rather than a rank.
+    fn select_first_worker(&self) -> Result<String, String> {
+        self.worker_registry
+            .get_all()
+            .into_iter()
+            .find(|worker| worker.is_available())
+            .map(|worker| worker.url().to_string())
+            .ok_or_else(|| "No available workers".to_string())
+    }
+
     fn available_worker_base_urls(&self) -> Vec<String> {
         let mut urls: Vec<String> = self
             .worker_registry
@@ -1119,7 +1165,7 @@ impl Router {
         };
 
         // All-grpc chat: tokenize once, outside policy and retry.
-        // Policy still uses extract_text_for_routing (session / empty).
+        // Policy uses the session or serialized message history for affinity.
         // token_ids stay on PreparedChat for a later token-level policy —
         // do not dump 131k ids into the cache_aware tree.
         let prepared = if matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc))
@@ -1153,6 +1199,10 @@ impl Router {
         };
 
         let text = typed_req.extract_text_for_routing();
+        // Keep one logical activity alive across all retry attempts. It is
+        // marked only after a worker has actually been selected, so requests
+        // rejected before assignment never contribute to the running gauge.
+        let request_activity = self.request_metrics.begin_request();
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1195,6 +1245,8 @@ impl Router {
                     }
                 };
 
+                request_activity.mark_assigned();
+
                 // Optional load tracking for the cache-aware policy. The RAII
                 // guard owns the count for this attempt: it is released exactly
                 // once on drop (failures, retries) or when the stream-forwarding
@@ -1222,6 +1274,7 @@ impl Router {
                             prepared: prepared.clone(),
                         },
                         program_completion.clone(),
+                        request_activity.clone(),
                     )
                     .await;
 
@@ -1390,6 +1443,7 @@ impl Router {
         typed_req: &T,
         dispatch: TypedDispatch<'_>,
         program_completion: Option<ProgramCompletion>,
+        request_activity: RequestActivity,
     ) -> Response {
         let TypedDispatch {
             headers,
@@ -1425,6 +1479,16 @@ impl Router {
             }
             if let Some(completion) = &program_completion {
                 completion.finish(response.status().is_success());
+            }
+            if is_stream && response.status().is_success() {
+                let (parts, body) = response.into_parts();
+                response = Response::from_parts(
+                    parts,
+                    Body::from_stream(super::guarded_stream(
+                        body.into_data_stream(),
+                        request_activity,
+                    )),
+                );
             }
             return response;
         }
@@ -1574,73 +1638,10 @@ impl Router {
                 completion.finish(response.status().is_success());
             }
             response
-        } else if let Some(guard) = load_guard {
-            let completion = if status.is_success() {
-                program_completion
-            } else {
-                None
-            };
-            // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-            if stages_on {
-                let header_stages = http_stages_json(http_ttfb_ms, http_ttfb_ms);
-                insert_router_stages(&mut response_headers, &header_stages);
-            }
-
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward the stream; `guard` drops when it ends,
-            // covering normal completion, upstream errors and client
-            // disconnects (send fails once the receiver is dropped).
-            tokio::spawn(async move {
-                let mut stream = stream;
-                let mut first_sse = true;
-                let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if first_sse {
-                                first_sse = false;
-                                let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
-                                if stages_on {
-                                    let stages = http_stages_json(http_ttfb_ms, first_ms);
-                                    emit_http_first_sse(&tx, &stages);
-                                }
-                            }
-                            if let Some(completion) = &completion {
-                                completion.observe_sse_chunk(&bytes);
-                            }
-                            if tx.send(Ok(bytes)).is_err() {
-                                stream_succeeded = false;
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            stream_succeeded = false;
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-                if let Some(completion) = &completion {
-                    completion.finish(stream_succeeded);
-                }
-                drop(guard);
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-            response
         } else {
-            // For requests without load tracking, just stream
-            // Preserve headers for streaming response
+            // Keep request activity and optional per-worker load ownership in
+            // the response body stream. Dropping the body drops this state
+            // immediately, including on downstream disconnect.
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
@@ -1649,52 +1650,13 @@ impl Router {
                 insert_router_stages(&mut response_headers, &header_stages);
             }
 
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let completion = if status.is_success() {
-                program_completion
-            } else {
-                None
-            };
-
-            // Spawn task to forward stream
-            tokio::spawn(async move {
-                let mut stream = stream;
-                let mut first_sse = true;
-                let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if first_sse {
-                                first_sse = false;
-                                let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
-                                if stages_on {
-                                    let stages = http_stages_json(http_ttfb_ms, first_ms);
-                                    emit_http_first_sse(&tx, &stages);
-                                }
-                            }
-                            if let Some(completion) = &completion {
-                                completion.observe_sse_chunk(&bytes);
-                            }
-                            if tx.send(Ok(bytes)).is_err() {
-                                stream_succeeded = false;
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            stream_succeeded = false;
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-                if let Some(completion) = &completion {
-                    completion.finish(stream_succeeded);
-                }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
+            let completion = status.is_success().then_some(program_completion).flatten();
+            let stream =
+                observed_http_stream(res, completion, stages_on.then_some((t_send, http_ttfb_ms)));
+            let body = Body::from_stream(super::guarded_stream(
+                stream,
+                (load_guard, request_activity),
+            ));
 
             let mut response = Response::new(body);
             *response.status_mut() = status;
@@ -2531,6 +2493,14 @@ impl RouterTrait for Router {
             request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
         }
 
+        // Messages uses the transparent fallback instead of route_typed_request.
+        // Count this inference request, but not arbitrary proxied admin requests.
+        let request_activity = (method == Method::POST && path == "/v1/messages").then(|| {
+            let activity = self.request_metrics.begin_request();
+            activity.mark_assigned();
+            activity
+        });
+
         // Send request
         match otel_http::send_client_request(
             request_builder,
@@ -2563,7 +2533,10 @@ impl RouterTrait for Router {
 
                 if Self::should_proxy_transparent_directly(program_completion.is_some()) {
                     response_builder
-                        .body(Body::from_stream(response.bytes_stream()))
+                        .body(Body::from_stream(super::guarded_stream(
+                            response.bytes_stream(),
+                            request_activity,
+                        )))
                         .unwrap_or_else(|error| {
                             (
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2607,36 +2580,13 @@ impl RouterTrait for Router {
                         }
                     }
                 } else {
-                    let stream = response.bytes_stream();
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     let completion = status.is_success().then_some(program_completion).flatten();
-                    tokio::spawn(async move {
-                        let mut stream = stream;
-                        let mut stream_ok = true;
-                        while let Some(chunk) = stream.next().await {
-                            match chunk {
-                                Ok(bytes) => {
-                                    if let Some(completion) = &completion {
-                                        completion.observe_sse_chunk(&bytes);
-                                    }
-                                    if tx.send(Ok(bytes)).is_err() {
-                                        stream_ok = false;
-                                        break;
-                                    }
-                                }
-                                Err(error) => {
-                                    stream_ok = false;
-                                    let _ = tx.send(Err(format!("Stream error: {error}")));
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(completion) = completion {
-                            completion.finish(stream_ok);
-                        }
-                    });
+                    let stream = observed_http_stream(response, completion, None);
                     response_builder
-                        .body(Body::from_stream(UnboundedReceiverStream::new(rx)))
+                        .body(Body::from_stream(super::guarded_stream(
+                            stream,
+                            request_activity,
+                        )))
                         .unwrap_or_else(|error| {
                             (
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2691,6 +2641,7 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
+            request_metrics: RouterRequestMetrics::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             program_scheduler: None,
@@ -2722,6 +2673,7 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
+            request_metrics: RouterRequestMetrics::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             program_scheduler: None,
@@ -2880,14 +2832,18 @@ mod tests {
             WorkerType::Regular,
         ));
 
-        let response =
-            hold_load_until_body_done(Response::new(Body::from("complete")), WorkerLoadGuard::new(worker.clone()));
+        let response = hold_load_until_body_done(
+            Response::new(Body::from("complete")),
+            WorkerLoadGuard::new(worker.clone()),
+        );
         assert_eq!(worker.load(), 1);
         let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(worker.load(), 0);
 
-        let response =
-            hold_load_until_body_done(Response::new(Body::from("cancelled")), WorkerLoadGuard::new(worker.clone()));
+        let response = hold_load_until_body_done(
+            Response::new(Body::from("cancelled")),
+            WorkerLoadGuard::new(worker.clone()),
+        );
         assert_eq!(worker.load(), 1);
         drop(response);
         assert_eq!(worker.load(), 0);
@@ -2985,6 +2941,7 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
+            request_metrics: RouterRequestMetrics::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             program_scheduler: None,

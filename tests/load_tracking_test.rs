@@ -27,6 +27,15 @@ struct TestContext {
 
 impl TestContext {
     async fn new(config: MockWorkerConfig, retry_max_retries: u32) -> Self {
+        Self::new_with_options(config, retry_max_retries, 1, 10).await
+    }
+
+    async fn new_with_options(
+        config: MockWorkerConfig,
+        retry_max_retries: u32,
+        dp_size: usize,
+        retry_backoff_ms: u64,
+    ) -> Self {
         let router_config = RouterConfig {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
@@ -43,11 +52,12 @@ impl TestContext {
             worker_startup_check_interval_secs: 1,
             retry: vllm_router_rs::config::RetryConfig {
                 max_retries: retry_max_retries,
-                initial_backoff_ms: 10,
-                max_backoff_ms: 50,
+                initial_backoff_ms: retry_backoff_ms,
+                max_backoff_ms: retry_backoff_ms,
                 backoff_multiplier: 1.0,
                 jitter_factor: 0.0,
             },
+            intra_node_data_parallel_size: dp_size,
             ..Default::default()
         };
 
@@ -92,6 +102,10 @@ impl TestContext {
             .load()
     }
 
+    fn running_requests(&self) -> u64 {
+        self.app_context.request_metrics.running_count()
+    }
+
     fn add_in_flight(&self, n: usize) {
         let worker = self
             .app_context
@@ -103,15 +117,25 @@ impl TestContext {
         }
     }
 
-    async fn chat_request(&self, stream: bool) -> axum::response::Response {
-        let body: ChatCompletionRequest = serde_json::from_value(json!({
+    fn chat_body(stream: bool) -> ChatCompletionRequest {
+        serde_json::from_value(json!({
             "model": "mock-model",
             "messages": [{"role": "user", "content": "hello"}],
             "stream": stream,
         }))
-        .expect("valid chat request");
+        .expect("valid chat request")
+    }
 
-        self.router.route_chat(None, &body, None).await
+    async fn chat_request(&self, stream: bool) -> axum::response::Response {
+        self.router
+            .route_chat(None, &Self::chat_body(stream), None)
+            .await
+    }
+
+    fn spawn_chat(&self, stream: bool) -> tokio::task::JoinHandle<axum::response::Response> {
+        let router = self.router.clone();
+        let body = Self::chat_body(stream);
+        tokio::spawn(async move { router.route_chat(None, &body, None).await })
     }
 
     async fn shutdown(mut self) {
@@ -122,11 +146,91 @@ impl TestContext {
     }
 }
 
+#[tokio::test]
+async fn test_dp_ranks_count_one_logical_running_request() {
+    let ctx = TestContext::new_with_options(
+        MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 500,
+            fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
+        },
+        0,
+        4,
+        10,
+    )
+    .await;
+
+    assert_eq!(ctx.app_context.worker_registry.get_all().len(), 4);
+    let request = ctx.spawn_chat(false);
+
+    assert_eq!(
+        wait_for_running(&ctx, 1, Duration::from_secs(2)).await,
+        1,
+        "four DP rank representations must still count one logical request"
+    );
+    assert!(request.await.unwrap().status().is_success());
+    assert_eq!(ctx.running_requests(), 0);
+
+    ctx.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_standard_running_stays_set_across_retry_backoff() {
+    let ctx = TestContext::new_with_options(
+        MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 1.0,
+            stream_chunk_delay_ms: 0,
+        },
+        2,
+        1,
+        300,
+    )
+    .await;
+
+    let request = ctx.spawn_chat(false);
+
+    assert_eq!(wait_for_running(&ctx, 1, Duration::from_secs(1)).await, 1);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        ctx.running_requests(),
+        1,
+        "logical request must remain running between retry attempts"
+    );
+
+    assert_eq!(
+        request.await.unwrap().status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(ctx.running_requests(), 0);
+
+    ctx.shutdown().await;
+}
+
 async fn wait_for_load(ctx: &TestContext, expected: usize, timeout: Duration) -> usize {
     let start = std::time::Instant::now();
     let mut last = ctx.worker_load();
     while start.elapsed() < timeout {
         last = ctx.worker_load();
+        if last == expected {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    last
+}
+
+async fn wait_for_running(ctx: &TestContext, expected: u64, timeout: Duration) -> u64 {
+    let start = std::time::Instant::now();
+    let mut last = ctx.running_requests();
+    while start.elapsed() < timeout {
+        last = ctx.running_requests();
         if last == expected {
             return last;
         }
@@ -165,6 +269,7 @@ async fn test_retryable_failure_preserves_baseline_load() {
 
     // Exactly one decrement per attempt: baseline is intact.
     assert_eq!(ctx.worker_load(), 2);
+    assert_eq!(ctx.running_requests(), 0);
 
     ctx.shutdown().await;
 }
@@ -234,6 +339,7 @@ async fn test_streaming_completion_releases_load_exactly_once() {
 
     let response = ctx.chat_request(true).await;
     assert!(response.status().is_success());
+    assert_eq!(ctx.running_requests(), 1);
 
     let mut stream = response.into_body().into_data_stream();
     let mut marker_seen = false;
@@ -255,6 +361,7 @@ async fn test_streaming_completion_releases_load_exactly_once() {
         load, baseline,
         "load must return to baseline after stream end"
     );
+    assert_eq!(ctx.running_requests(), 0);
 
     ctx.shutdown().await;
 }
@@ -286,6 +393,11 @@ async fn test_embedded_done_marker_does_not_release_load_early() {
     // Chunk 1 (plain content).
     let _ = stream.next().await.expect("first chunk");
     assert_eq!(ctx.worker_load(), baseline + 1, "load held during stream");
+    assert_eq!(
+        ctx.running_requests(),
+        1,
+        "logical request held during stream"
+    );
 
     // Chunk 2 embeds `data: [DONE]` inside message content; the load must
     // still be held afterwards.
@@ -301,6 +413,7 @@ async fn test_embedded_done_marker_does_not_release_load_early() {
     while stream.next().await.is_some() {}
     let load = wait_for_load(&ctx, baseline, Duration::from_secs(3)).await;
     assert_eq!(load, baseline);
+    assert_eq!(ctx.running_requests(), 0);
 
     ctx.shutdown().await;
 }
@@ -330,6 +443,7 @@ async fn test_client_disconnect_releases_load() {
     let mut stream = response.into_body().into_data_stream();
     let _ = stream.next().await.expect("first chunk");
     assert_eq!(ctx.worker_load(), baseline + 1);
+    assert_eq!(ctx.running_requests(), 1);
 
     // Simulate the client disconnecting by dropping the body.
     drop(stream);
@@ -338,6 +452,11 @@ async fn test_client_disconnect_releases_load() {
     assert_eq!(
         load, baseline,
         "client disconnect must release the in-flight load"
+    );
+    assert_eq!(
+        wait_for_running(&ctx, 0, Duration::from_secs(1)).await,
+        0,
+        "client disconnect must release the logical running count"
     );
 
     ctx.shutdown().await;
@@ -361,27 +480,16 @@ async fn test_concurrent_requests_track_load_accurately() {
     let baseline = ctx.baseline_load();
     let concurrency = 8;
 
-    let mut tasks = Vec::new();
-    for _ in 0..concurrency {
-        let router = ctx.router.clone();
-        tasks.push(tokio::spawn(async move {
-            let body: ChatCompletionRequest = serde_json::from_value(json!({
-                "model": "mock-model",
-                "messages": [{"role": "user", "content": "hello"}],
-                "stream": false,
-            }))
-            .unwrap();
-            let response = router.route_chat(None, &body, None).await;
-            assert!(response.status().is_success());
-        }));
-    }
+    let tasks: Vec<_> = (0..concurrency).map(|_| ctx.spawn_chat(false)).collect();
 
     // While all requests are in flight, the load must reflect all of them.
     let mut observed_max = baseline;
+    let mut observed_running_max = 0;
     let deadline = std::time::Instant::now() + Duration::from_millis(400);
     while std::time::Instant::now() < deadline {
         observed_max = observed_max.max(ctx.worker_load());
-        if observed_max >= baseline + concurrency {
+        observed_running_max = observed_running_max.max(ctx.running_requests());
+        if observed_max >= baseline + concurrency && observed_running_max >= concurrency as u64 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -391,14 +499,53 @@ async fn test_concurrent_requests_track_load_accurately() {
         baseline + concurrency,
         "all in-flight requests must be counted"
     );
+    assert_eq!(
+        observed_running_max, concurrency as u64,
+        "standard running gauge must count each logical request once"
+    );
 
     for task in tasks {
-        task.await.unwrap();
+        assert!(task.await.unwrap().status().is_success());
     }
 
     // No drift after completion: exactly-once increment and decrement.
     let load = wait_for_load(&ctx, baseline, Duration::from_secs(3)).await;
     assert_eq!(load, baseline, "load must return to baseline without drift");
+    assert_eq!(ctx.running_requests(), 0);
+
+    ctx.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_cancelled_request_releases_standard_running_count() {
+    let ctx = TestContext::new(
+        MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 5_000,
+            fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
+        },
+        0,
+    )
+    .await;
+
+    let request = ctx.spawn_chat(false);
+
+    assert_eq!(
+        wait_for_running(&ctx, 1, Duration::from_secs(2)).await,
+        1,
+        "request must be counted after backend assignment"
+    );
+
+    request.abort();
+    let _ = request.await;
+    assert_eq!(
+        wait_for_running(&ctx, 0, Duration::from_secs(1)).await,
+        0,
+        "aborting the request future must release the logical count"
+    );
 
     ctx.shutdown().await;
 }

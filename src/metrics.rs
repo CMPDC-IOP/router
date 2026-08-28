@@ -1,12 +1,180 @@
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
+pub use metrics_exporter_prometheus::PrometheusHandle;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct PrometheusConfig {
     pub port: u16,
     pub host: String,
+}
+
+const RUNNING_REQUESTS_METRIC: &str = "vllm:num_requests_running";
+const WAITING_REQUESTS_METRIC: &str = "vllm:num_requests_waiting";
+
+#[derive(Debug)]
+struct RequestMetricsInner {
+    running: AtomicU64,
+    waiting: AtomicU64,
+    waiting_enabled: AtomicBool,
+    waiting_initializer: Once,
+}
+
+/// Shared request activity counters used for vLLM-compatible metrics.
+///
+/// The running counter is always initialized. The waiting counter is only
+/// registered after [`RouterRequestMetrics::enable_waiting`] is called.
+#[derive(Clone, Debug)]
+pub struct RouterRequestMetrics {
+    inner: Arc<RequestMetricsInner>,
+}
+
+impl RouterRequestMetrics {
+    /// Create a new set of request counters with no active requests.
+    pub fn new() -> Self {
+        describe_gauge!(
+            RUNNING_REQUESTS_METRIC,
+            "Number of router logical requests assigned to a worker and not yet completed (including backend waiting and retries)"
+        );
+        gauge!(RUNNING_REQUESTS_METRIC).set(0.0);
+
+        Self {
+            inner: Arc::new(RequestMetricsInner {
+                running: AtomicU64::new(0),
+                waiting: AtomicU64::new(0),
+                waiting_enabled: AtomicBool::new(false),
+                waiting_initializer: Once::new(),
+            }),
+        }
+    }
+
+    /// Return a cloneable, initially inactive activity handle.
+    pub fn begin_request(&self) -> RequestActivity {
+        RequestActivity {
+            inner: Arc::new(RequestActivityInner {
+                metrics: self.clone(),
+                assigned: Once::new(),
+            }),
+        }
+    }
+
+    /// Enable and initialize the waiting-request metric.
+    pub fn enable_waiting(&self) {
+        let inner = Arc::clone(&self.inner);
+        inner.waiting_initializer.call_once(|| {
+            describe_gauge!(
+                WAITING_REQUESTS_METRIC,
+                "Number of requests waiting in the router admission queue (excludes backend queues)"
+            );
+            gauge!(WAITING_REQUESTS_METRIC).set(inner.waiting.load(Ordering::Acquire) as f64);
+            inner.waiting_enabled.store(true, Ordering::Release);
+        });
+    }
+
+    /// Start tracking one waiting request. The guard is inactive until waiting
+    /// metrics have been enabled.
+    pub fn begin_waiting(&self) -> WaitingRequestGuard {
+        let active = self.inner.waiting_enabled.load(Ordering::Acquire);
+        if active {
+            self.inner.waiting.fetch_add(1, Ordering::AcqRel);
+            gauge!(WAITING_REQUESTS_METRIC).increment(1.0);
+        }
+
+        WaitingRequestGuard {
+            metrics: self.clone(),
+            active,
+        }
+    }
+
+    /// Return the current number of running requests.
+    pub fn running_count(&self) -> u64 {
+        self.inner.running.load(Ordering::Acquire)
+    }
+
+    /// Return the current number of waiting requests.
+    pub fn waiting_count(&self) -> u64 {
+        self.inner.waiting.load(Ordering::Acquire)
+    }
+
+    fn increment_running(&self) {
+        self.inner.running.fetch_add(1, Ordering::AcqRel);
+        gauge!(RUNNING_REQUESTS_METRIC).increment(1.0);
+    }
+
+    fn decrement_running(&self) {
+        Self::decrement(&self.inner.running, RUNNING_REQUESTS_METRIC);
+    }
+
+    fn decrement_waiting(&self) {
+        Self::decrement(&self.inner.waiting, WAITING_REQUESTS_METRIC);
+    }
+
+    fn decrement(counter: &AtomicU64, metric: &'static str) {
+        if counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+        {
+            gauge!(metric).decrement(1.0);
+        }
+    }
+}
+
+impl Default for RouterRequestMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug)]
+struct RequestActivityInner {
+    metrics: RouterRequestMetrics,
+    assigned: Once,
+}
+
+/// Cloneable logical activity for one request.
+///
+/// Calling [`RequestActivity::mark_assigned`] on any clone increments the
+/// running counter once. The counter is decremented when the last clone is
+/// dropped.
+#[derive(Clone, Debug)]
+pub struct RequestActivity {
+    inner: Arc<RequestActivityInner>,
+}
+
+impl RequestActivity {
+    /// Mark this logical request as assigned to a worker.
+    pub fn mark_assigned(&self) {
+        self.inner
+            .assigned
+            .call_once(|| self.inner.metrics.increment_running());
+    }
+}
+
+impl Drop for RequestActivityInner {
+    fn drop(&mut self) {
+        if self.assigned.is_completed() {
+            self.metrics.decrement_running();
+        }
+    }
+}
+
+/// RAII guard for one request waiting in the router queue.
+pub struct WaitingRequestGuard {
+    metrics: RouterRequestMetrics,
+    active: bool,
+}
+
+impl Drop for WaitingRequestGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.metrics.decrement_waiting();
+        }
+    }
 }
 
 impl Default for PrometheusConfig {
@@ -277,6 +445,12 @@ pub fn init_metrics() {
         "Number of running requests per worker"
     );
 
+    // vLLM-compatible aggregate request metrics
+    describe_gauge!(
+        RUNNING_REQUESTS_METRIC,
+        "Number of router logical requests assigned to a worker and not yet completed (including backend waiting and retries)"
+    );
+
     // Tokenizer metrics
     describe_histogram!(
         "vllm_tokenizer_encode_duration_seconds",
@@ -392,7 +566,7 @@ pub fn init_metrics() {
     );
 }
 
-pub fn start_prometheus(config: PrometheusConfig) {
+pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     // Initialize metric descriptions
     init_metrics();
 
@@ -415,13 +589,21 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .with_http_listener(socket_addr)
         .upkeep_timeout(Duration::from_secs(5 * 60));
     let builder = set_program_scheduling_buckets(builder);
-    builder
+    let (recorder, exporter) = builder
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
         .set_buckets_for_metric(rate_matcher, &rate_bucket)
         .expect("failed to set match-rate bucket")
-        .install()
-        .expect("failed to install Prometheus metrics exporter");
+        .build()
+        .expect("failed to build Prometheus metrics exporter");
+    let handle = recorder.handle();
+
+    metrics::set_global_recorder(recorder).expect("failed to install Prometheus metrics exporter");
+
+    gauge!(RUNNING_REQUESTS_METRIC).set(0.0);
+    tokio::spawn(exporter);
+
+    handle
 }
 
 fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuilder {
@@ -1346,6 +1528,143 @@ mod tests {
         RouterMetrics::record_discovery_update(3, 1);
         RouterMetrics::record_generate_duration(Duration::from_secs(2));
         RouterMetrics::set_running_requests("http://worker1", 15);
+    }
+
+    fn with_request_metrics(test: impl FnOnce(&RouterRequestMetrics, &PrometheusHandle)) -> String {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || test(&RouterRequestMetrics::new(), &handle));
+        handle.render()
+    }
+
+    #[test]
+    fn test_request_metrics_render_vllm_running_gauge_without_labels() {
+        let text = with_request_metrics(|request_metrics, _| {
+            assert_eq!(request_metrics.running_count(), 0);
+        });
+
+        assert!(text.contains("# TYPE vllm:num_requests_running gauge"));
+        assert!(
+            text.contains("vllm:num_requests_running 0"),
+            "running gauge must be initialized with an unlabeled sample, got: {text}"
+        );
+        assert!(
+            !text.contains("vllm:num_requests_running{"),
+            "running gauge must not have labels, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_request_activity_marks_once_and_drops_on_last_clone() {
+        with_request_metrics(|request_metrics, _| {
+            let activity = request_metrics.begin_request();
+            let clone = activity.clone();
+
+            clone.mark_assigned();
+            activity.mark_assigned();
+            assert_eq!(request_metrics.running_count(), 1);
+
+            drop(activity);
+            assert_eq!(request_metrics.running_count(), 1);
+
+            drop(clone);
+            assert_eq!(request_metrics.running_count(), 0);
+        });
+    }
+
+    #[test]
+    fn test_running_aggregates_logical_requests_across_workers() {
+        with_request_metrics(|request_metrics, handle| {
+            let worker_one: Vec<_> = (0..2).map(|_| request_metrics.begin_request()).collect();
+            let worker_two: Vec<_> = (0..3).map(|_| request_metrics.begin_request()).collect();
+
+            for activity in worker_one.iter().chain(worker_two.iter()) {
+                activity.mark_assigned();
+            }
+
+            assert_eq!(request_metrics.running_count(), 5);
+            assert!(handle.render().contains("vllm:num_requests_running 5"));
+
+            drop(worker_one);
+            drop(worker_two);
+            assert_eq!(request_metrics.running_count(), 0);
+        });
+    }
+
+    #[test]
+    fn test_dp_rank_representations_do_not_duplicate_logical_request() {
+        with_request_metrics(|request_metrics, _| {
+            let logical_request = request_metrics.begin_request();
+            let rank_representations = [
+                logical_request.clone(),
+                logical_request.clone(),
+                logical_request.clone(),
+                logical_request.clone(),
+            ];
+
+            for rank in &rank_representations {
+                rank.mark_assigned();
+            }
+
+            assert_eq!(request_metrics.running_count(), 1);
+            drop(rank_representations);
+            assert_eq!(request_metrics.running_count(), 1);
+            drop(logical_request);
+            assert_eq!(request_metrics.running_count(), 0);
+        });
+    }
+
+    #[test]
+    fn test_waiting_metric_is_absent_until_enabled() {
+        let text = with_request_metrics(|request_metrics, _| {
+            let guard = request_metrics.begin_waiting();
+            assert_eq!(request_metrics.waiting_count(), 0);
+            drop(guard);
+        });
+
+        assert!(
+            !text.contains(WAITING_REQUESTS_METRIC),
+            "waiting gauge must be absent before enable_waiting"
+        );
+    }
+
+    #[test]
+    fn test_waiting_metric_enable_and_guard_lifecycle() {
+        let text = with_request_metrics(|request_metrics, _| {
+            request_metrics.enable_waiting();
+            assert_eq!(request_metrics.waiting_count(), 0);
+
+            let guard = request_metrics.begin_waiting();
+            assert_eq!(request_metrics.waiting_count(), 1);
+            drop(guard);
+            assert_eq!(request_metrics.waiting_count(), 0);
+        });
+
+        assert!(text.contains("# TYPE vllm:num_requests_waiting gauge"));
+        assert!(
+            text.contains("vllm:num_requests_waiting 0"),
+            "enabled waiting gauge must be initialized with an unlabeled sample, got: {text}"
+        );
+        assert!(
+            !text.contains("vllm:num_requests_waiting{"),
+            "waiting gauge must not have labels, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_existing_router_metrics_remain_unchanged() {
+        let text = with_request_metrics(|request_metrics, _| {
+            RouterMetrics::set_running_requests("http://worker-a", 2);
+            RouterMetrics::set_cb_state("http://worker-a", 1);
+            RouterMetrics::set_worker_health("http://worker-a", true);
+
+            let activity = request_metrics.begin_request();
+            activity.mark_assigned();
+        });
+
+        assert!(text.contains("vllm_router_running_requests{worker=\"http://worker-a\"} 2"));
+        assert!(text.contains("vllm_router_cb_state{worker=\"http://worker-a\"} 1"));
+        assert!(text.contains("vllm_router_worker_health{worker=\"http://worker-a\"} 1"));
     }
 
     #[test]
