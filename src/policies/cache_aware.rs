@@ -180,10 +180,12 @@ impl CacheAwarePolicy {
         if request_text.is_empty() {
             return;
         }
-        self.trees
+        let tree = self
+            .trees
             .entry(normalize_model_key(model_id).to_string())
             .or_insert_with(|| Arc::new(Tree::new()))
-            .insert(request_text, target_id);
+            .clone();
+        Self::insert_and_record(&tree, request_text, target_id, self.config.max_tree_size);
     }
 
     /// Remove one unavailable target from a model's affinity tree.
@@ -289,7 +291,7 @@ impl CacheAwarePolicy {
 
             if let Some(tree) = tree {
                 let worker_url = workers[min_load_idx].url();
-                tree.insert_capped(text, worker_url, self.config.max_tree_size);
+                Self::insert_and_record(&tree, text, worker_url, self.config.max_tree_size);
             } else {
                 debug!(
                     "Warning: No tree found for model '{}', skipping cache update",
@@ -304,6 +306,20 @@ impl CacheAwarePolicy {
         RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
 
         Some(min_load_idx)
+    }
+
+    /// Insert into the model's tree with budget enforcement, then mirror the
+    /// outcome into metrics: the per-worker tree size always, plus a skip
+    /// counter when the worker was already at its budget and the update was
+    /// dropped.
+    fn insert_and_record(tree: &Arc<Tree>, text: &str, worker_url: &str, max_tree_size: usize) {
+        let inserted = tree.insert_capped(text, worker_url, max_tree_size);
+        if !inserted {
+            RouterMetrics::record_tree_cap_skipped(worker_url);
+        }
+        if let Some(size) = tree.tenant_char_count.get(worker_url) {
+            RouterMetrics::set_tree_size(worker_url, *size);
+        }
     }
 }
 
@@ -392,9 +408,12 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             "Cache match for model '{}': matched_chars={}, input_chars={}, match_rate={:.2}",
             model_id, result.matched_char_count, result.input_char_count, match_rate
         );
+        RouterMetrics::record_cache_match_rate(match_rate);
+
         // Select worker without String allocation
         let selected_idx = if match_rate > self.config.cache_threshold {
             // Cache hit path: find worker by URL (compare &str directly, no allocation)
+            RouterMetrics::record_cache_hit();
             let tenant_url: &str = &result.tenant;
             workers
                 .iter()
@@ -402,6 +421,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 .filter(|&idx| workers[idx].is_healthy())
         } else {
             // Low cache match: use worker with minimum load
+            RouterMetrics::record_cache_miss();
             healthy_indices
                 .iter()
                 .min_by_key(|&&idx| workers[idx].load())
@@ -409,10 +429,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         };
 
         if let Some(idx) = selected_idx {
-            // Update the tree with this request (use worker URL directly, no
-            // allocation). Capped so a full tenant stops learning instead of
-            // growing past its budget between eviction passes.
-            tree.insert_capped(text, workers[idx].url(), self.config.max_tree_size);
+            // Update the tree with this request. Capped so a full tenant
+            // stops learning instead of growing past its budget between
+            // eviction passes.
+            Self::insert_and_record(&tree, text, workers[idx].url(), self.config.max_tree_size);
 
             // Increment processed counter
             workers[idx].increment_processed();
@@ -425,6 +445,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // Selected worker no longer exists or unhealthy, remove stale tenant from tree
         if match_rate > self.config.cache_threshold {
             let tenant_url: &str = &result.tenant;
+            RouterMetrics::record_cache_stale_hit(tenant_url);
             tree.remove_tenant(tenant_url);
             debug!("Removed stale worker {} from cache tree", tenant_url);
         }
@@ -667,6 +688,99 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_aware_records_hit_miss_and_tree_size_metrics() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            let config = CacheAwareConfig {
+                eviction_interval_secs: 0,
+                ..Default::default()
+            };
+            let policy = CacheAwarePolicy::with_config(config);
+            let workers: Vec<Arc<dyn Worker>> = vec![
+                Arc::new(BasicWorker::new(
+                    "http://w1:8000".to_string(),
+                    WorkerType::Regular,
+                )),
+                Arc::new(BasicWorker::new(
+                    "http://w2:8000".to_string(),
+                    WorkerType::Regular,
+                )),
+            ];
+            policy.init_workers(&workers);
+
+            // First request has nothing in the tree: rate 0 → miss, shortest
+            // queue picks w1 and learns the text.
+            policy
+                .select_worker(&workers, Some("unique-prefix-alpha"))
+                .unwrap();
+            // Second request shares the learned prefix: rate 1.0 → hit to w1.
+            policy
+                .select_worker(&workers, Some("unique-prefix-beta"))
+                .unwrap();
+        });
+
+        let text = handle.render();
+        assert!(
+            text.contains("vllm_router_cache_misses_total 1"),
+            "one miss expected, got: {text}"
+        );
+        assert!(
+            text.contains("vllm_router_cache_hits_total 1"),
+            "one hit expected, got: {text}"
+        );
+        assert!(
+            text.contains("vllm_router_cache_match_rate_count 2"),
+            "match rate histogram must cover both decisions, got: {text}"
+        );
+        assert!(
+            text.contains(r#"vllm_router_tree_size{worker="http://w1:8000"}"#),
+            "tree size gauge must be reported per worker, got: {text}"
+        );
+        assert!(
+            !text.contains("vllm_router_tree_cap_skipped_total 1"),
+            "no skips expected with the default budget, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_cache_aware_records_tree_cap_skips() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            let config = CacheAwareConfig {
+                eviction_interval_secs: 0,
+                max_tree_size: 50,
+                ..Default::default()
+            };
+            let policy = CacheAwarePolicy::with_config(config);
+            let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            ))];
+            policy.init_workers(&workers);
+
+            // Distinct 40-char texts: the first fit under the 50-char budget,
+            // the rest must be skipped and counted.
+            for i in 0..20u8 {
+                let text = format!(
+                    "{}0123456789012345678901234567890123456789",
+                    (b'a' + i) as char
+                );
+                policy.select_worker(&workers, Some(&text)).unwrap();
+            }
+        });
+
+        let text = handle.render();
+        assert!(
+            text.contains(r#"vllm_router_tree_cap_skipped_total{worker="http://w1:8000"} 18"#),
+            "18 of 20 updates must be skipped at the budget, got: {text}"
+        );
+    }
+
+    #[test]
     fn test_cache_aware_worker_removal() {
         let config = CacheAwareConfig {
             eviction_interval_secs: 0, // Disable eviction thread
@@ -739,6 +853,29 @@ mod tests {
                 .unwrap()
                 .target_id,
             "rank-0"
+        );
+    }
+
+    #[test]
+    fn committed_program_placements_respect_tree_budget() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            max_tree_size: 10,
+            ..Default::default()
+        });
+
+        // Program scheduling commits after admission instead of going through
+        // select_worker_with_headers. Its tree updates must still be capped.
+        policy.commit_placement("model", "abcdefghij", "rank-0");
+        policy.commit_placement("model", "klmnopqrst", "rank-0");
+
+        assert_eq!(
+            policy
+                .get_tenant_char_counts("model")
+                .get("rank-0")
+                .copied(),
+            Some(10),
+            "the second committed placement must be skipped at the tenant budget"
         );
     }
 }
