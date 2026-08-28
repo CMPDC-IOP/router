@@ -57,6 +57,7 @@ async fn wasm_middleware_modify_reject_and_path_isolation() {
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
+        stream_chunk_delay_ms: 0,
     });
     let worker_url = worker.start().await.expect("start mock worker");
     let worker_port: u16 = worker_url

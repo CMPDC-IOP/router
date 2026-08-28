@@ -166,6 +166,7 @@ mod health_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -211,6 +212,7 @@ mod health_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
             },
             MockWorkerConfig {
                 port: 18004,
@@ -218,6 +220,7 @@ mod health_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
             },
         ])
         .await;
@@ -251,6 +254,7 @@ mod health_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -334,6 +338,7 @@ mod generation_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -375,6 +380,7 @@ mod generation_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -411,6 +417,7 @@ mod generation_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 1.0, // Always fail
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -442,6 +449,7 @@ mod generation_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -489,6 +497,7 @@ mod generation_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
             }],
         )
         .await;
@@ -598,6 +607,7 @@ mod model_info_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -635,6 +645,7 @@ mod model_info_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -676,6 +687,7 @@ mod model_info_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -792,6 +804,7 @@ mod model_info_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
             },
             MockWorkerConfig {
                 port: 18205,
@@ -799,6 +812,7 @@ mod model_info_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
             },
         ])
         .await;
@@ -837,6 +851,7 @@ mod model_info_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 1.0, // Always fail
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -877,6 +892,7 @@ mod worker_management_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let url = worker.start().await.unwrap();
 
@@ -919,6 +935,7 @@ mod worker_management_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -1012,6 +1029,7 @@ mod worker_management_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let url = worker.start().await.unwrap();
 
@@ -1052,6 +1070,7 @@ mod worker_management_tests {
             health_status: HealthStatus::Unhealthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
         let url = worker.start().await.unwrap();
 
@@ -1090,6 +1109,7 @@ mod router_policy_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
             },
             MockWorkerConfig {
                 port: 18802,
@@ -1097,6 +1117,7 @@ mod router_policy_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
             },
         ])
         .await;
@@ -1132,6 +1153,7 @@ mod router_policy_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -1162,6 +1184,7 @@ mod responses_endpoint_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -1208,6 +1231,7 @@ mod responses_endpoint_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
             }],
         )
         .await;
@@ -1254,6 +1278,7 @@ mod responses_endpoint_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -1295,6 +1320,7 @@ mod responses_endpoint_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -1344,6 +1370,7 @@ mod responses_endpoint_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -1393,6 +1420,7 @@ mod responses_endpoint_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -1430,6 +1458,7 @@ mod responses_endpoint_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
             },
             MockWorkerConfig {
                 port: 18961,
@@ -1437,6 +1466,7 @@ mod responses_endpoint_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
             },
         ])
         .await;
@@ -1499,6 +1529,7 @@ mod error_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -1538,6 +1569,7 @@ mod error_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -1617,6 +1649,7 @@ mod error_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
             }],
         )
         .await;
@@ -1636,6 +1669,7 @@ mod error_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -1674,6 +1708,7 @@ mod error_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -1707,6 +1742,7 @@ mod error_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -1745,6 +1781,7 @@ mod cache_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -1783,6 +1820,7 @@ mod cache_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
             },
             MockWorkerConfig {
                 port: 18503,
@@ -1790,6 +1828,7 @@ mod cache_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
             },
         ])
         .await;
@@ -1854,6 +1893,7 @@ mod load_balancing_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
             },
             MockWorkerConfig {
                 port: 18602,
@@ -1861,6 +1901,7 @@ mod load_balancing_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
             },
         ])
         .await;
@@ -1908,6 +1949,7 @@ mod pd_mode_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
 
         let mut decode_worker = MockWorker::new(MockWorkerConfig {
@@ -1916,6 +1958,7 @@ mod pd_mode_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         });
 
         let prefill_url = prefill_worker.start().await.unwrap();
@@ -1999,6 +2042,7 @@ mod request_id_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -2146,6 +2190,7 @@ mod request_id_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                stream_chunk_delay_ms: 0,
             }],
         )
         .await;
@@ -2190,6 +2235,7 @@ mod rerank_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -2244,6 +2290,7 @@ mod rerank_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -2291,6 +2338,7 @@ mod rerank_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -2335,6 +2383,7 @@ mod rerank_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 1.0, // Always fail
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -2368,6 +2417,7 @@ mod rerank_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
@@ -2428,6 +2478,7 @@ mod rerank_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            stream_chunk_delay_ms: 0,
         }])
         .await;
 
