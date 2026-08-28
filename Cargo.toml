@@ -125,6 +125,8 @@ portpicker = "0.1"
 tempfile = "3.8"
 lazy_static = "1.4"
 opentelemetry_sdk = { version = "0.27", features = ["testing"] }
+prometheus-scraper = { version = "0.2", default-features = false }
+
 # Per-process CPU and RSS accounting for the router overhead harness.
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
@@ -363,3 +365,19 @@ path = "tests/rust/worker_startup_test.rs"
 [[test]]
 name = "cache_memory_test"
 path = "tests/rust/cache_memory_test.rs"
+
+[[test]]
+name = "messages_metrics_test"
+path = "tests/rust/messages_metrics_test.rs"
+
+[[test]]
+name = "metrics_endpoint_test"
+path = "tests/rust/metrics_endpoint_test.rs"
+
+[[test]]
+name = "pd_stream_metrics_test"
+path = "tests/rust/pd_stream_metrics_test.rs"
+
+[[test]]
+name = "queue_metrics_test"
+path = "tests/rust/queue_metrics_test.rs"
