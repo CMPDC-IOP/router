@@ -81,6 +81,7 @@ impl MockWorker {
             .route("/get_model_info", get(model_info_handler))
             .route("/generate", post(generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
+            .route("/v1/messages", post(messages_handler))
             .route("/v1/completions", post(completions_handler))
             .route("/v1/rerank", post(rerank_handler))
             .route("/v1/responses", post(responses_handler))
@@ -396,6 +397,28 @@ async fn chat_completions_handler(
     // Capture request for test inspection
     capture_request(config.port, "/v1/chat/completions", &headers);
 
+    // Mirror real vLLM workers: asking for a large output budget triggers the
+    // OpenAI-layer context-length validation, which answers with a 400
+    // `BadRequestError` (unlike /v1/messages, see messages_handler).
+    let max_tokens = payload
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if max_tokens >= 128000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": "This model's maximum context length is 262144 tokens. However, you requested 128000 output tokens and your prompt contains at least 134145 input tokens, for a total of at least 262145 tokens. Please reduce the length of the input prompt or the number of requested output tokens. (parameter=input_tokens, value=134145)",
+                    "type": "BadRequestError",
+                    "param": "input_tokens",
+                    "code": 400
+                }
+            })),
+        )
+            .into_response();
+    }
+
     let is_stream = payload
         .get("stream")
         .and_then(|v| v.as_bool())
@@ -513,6 +536,80 @@ async fn chat_completions_handler(
         }))
         .into_response()
     }
+}
+
+/// Simulate the vLLM native Anthropic Messages endpoint. Error scenarios are
+/// selected by a `mock_messages_error` marker in the request body so tests can
+/// exercise the router's response mapping without replicating tokenizer
+/// arithmetic. Scenario bodies mirror real vLLM worker replies, including the
+/// worker-side quirk of answering validation failures with a 500
+/// `internal_error`.
+async fn messages_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let config = config.read().await;
+
+    if should_fail(&config).await {
+        return anthropic_internal_error_response("Random failure for testing");
+    }
+
+    match payload.get("mock_messages_error").and_then(|v| v.as_str()) {
+        Some("context_overflow") => anthropic_internal_error_response(
+            "This model's maximum context length is 262144 tokens. However, you requested 128000 output tokens and your prompt contains at least 134145 input tokens, for a total of at least 262145 tokens. Please reduce the length of the input prompt or the number of requested output tokens. (parameter=input_tokens, value=134145)",
+        ),
+        Some("max_completion_tokens") => anthropic_internal_error_response(
+            "max_completion_tokens=128000 cannot be greater than max_model_len=max_total_tokens=262144. Please reduce the number of requested output tokens.",
+        ),
+        Some("input_length") => anthropic_internal_error_response(
+            "Input length (270000 tokens) exceeds model's maximum context length (262144 tokens).",
+        ),
+        // A genuine server fault: no context-length text, must stay a 500.
+        Some("worker_crashed") => {
+            anthropic_internal_error_response("worker crashed while processing request")
+        }
+        // A worker that already maps the violation to Anthropic semantics.
+        Some("upstream_400") => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "This model's maximum context length is 262144 tokens. However, you requested 128000 output tokens."
+                }
+            })),
+        )
+            .into_response(),
+        _ => Json(json!({
+            "id": format!("chatcmpl-{}", Uuid::new_v4()),
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Hello from mock worker"}],
+            "model": "mock-model",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 5
+            }
+        }))
+        .into_response(),
+    }
+}
+
+/// The unstructured 500 a vLLM worker returns when its Anthropic error mapping
+/// fails to recognize a client-side validation error.
+fn anthropic_internal_error_response(message: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "type": "error",
+            "error": {
+                "type": "internal_error",
+                "message": message
+            }
+        })),
+    )
+        .into_response()
 }
 
 async fn completions_handler(

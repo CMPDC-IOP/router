@@ -7,6 +7,7 @@ use crate::{
     middleware::{self, QueuedRequest, TokenBucket},
     policies::PolicyRegistry,
     protocols::{
+        anthropic_error,
         spec::{
             ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
             InferenceGenerateRequest, RerankRequest, V1RerankReqInput,
@@ -159,10 +160,15 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
     };
 
     // Route through transparent proxy
-    state
+    let response = state
         .router
         .route_transparent(Some(&headers), &path, &method, body_json)
-        .await
+        .await;
+
+    // vLLM workers report client-side context-length violations on their
+    // native /v1/messages endpoint as 500 `internal_error`; surface them as
+    // 400 `invalid_request_error` instead. All other responses pass through.
+    anthropic_error::rewrite_context_overflow(&path, response).await
 }
 
 // Health check endpoints
