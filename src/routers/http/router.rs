@@ -33,10 +33,113 @@ use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::Client;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
+
+fn insert_router_stages(headers: &mut HeaderMap, stages: &serde_json::Value) {
+    if let Ok(value) = HeaderValue::from_str(&stages.to_string()) {
+        headers.insert("x-router-stages", value);
+    }
+}
+
+// Diagnostic only. For HTTP this measures router -> worker header wait and
+// first SSE byte; `engine_ms` is a residual, not EngineCore telemetry.
+fn http_stages_json(http_ttfb_ms: f64, first_sse_ms: f64) -> serde_json::Value {
+    serde_json::json!({
+        "path": "http_proxy",
+        "http_ttfb_ms": http_ttfb_ms,
+        "http_first_sse_ms": first_sse_ms,
+        "xfer_ms": http_ttfb_ms,
+        "first_token_ms": first_sse_ms,
+        "engine_ms": first_sse_ms - http_ttfb_ms,
+    })
+}
+
+fn emit_http_first_sse<E>(
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, E>>,
+    stages: &serde_json::Value,
+) {
+    let comment = format!(": router-stages {stages}\n\n");
+    info!(%stages, "http proxy stages");
+    let _ = tx.send(Ok(bytes::Bytes::from(comment)));
+}
+
+struct LoadTrackedBody {
+    inner: Pin<
+        Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Send + 'static>,
+    >,
+    worker: Option<Arc<dyn Worker>>,
+    producer_abort: Option<tokio::task::AbortHandle>,
+}
+
+impl LoadTrackedBody {
+    fn release(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            worker.decrement_load();
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
+        }
+    }
+}
+
+impl futures_util::Stream for LoadTrackedBody {
+    type Item = Result<bytes::Bytes, axum::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let item = self.inner.as_mut().poll_next(cx);
+        if matches!(item, Poll::Ready(None)) {
+            self.release();
+            self.producer_abort.take();
+        }
+        item
+    }
+}
+
+impl Drop for LoadTrackedBody {
+    fn drop(&mut self) {
+        if let Some(abort) = self.producer_abort.take() {
+            abort.abort();
+        }
+        self.release();
+    }
+}
+
+fn hold_load_until_body_done(mut response: Response, worker: Arc<dyn Worker>) -> Response {
+    let producer = response
+        .extensions_mut()
+        .remove::<crate::backend::grpc::GrpcStreamTask>()
+        .and_then(|task| task.take());
+    let producer_abort = producer.as_ref().map(tokio::task::JoinHandle::abort_handle);
+    let fallback_worker = if let Some(producer) = producer {
+        tokio::spawn(async move {
+            let _ = producer.await;
+            worker.decrement_load();
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
+        });
+        None
+    } else {
+        Some(worker)
+    };
+    let (parts, body) = response.into_parts();
+    let stream = LoadTrackedBody {
+        inner: Box::pin(body.into_data_stream()),
+        worker: fallback_worker,
+        producer_abort,
+    };
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+struct TypedDispatch<'a> {
+    headers: Option<&'a HeaderMap>,
+    route: &'a str,
+    worker_url: &'a str,
+    is_stream: bool,
+    load_incremented: bool,
+    prepared: Option<crate::backend::PreparedChat>,
+}
 
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
@@ -50,6 +153,8 @@ pub struct Router {
     api_key: Option<String>,
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
+    health_config: HealthConfig,
+    frontend: crate::backend::EngineFrontend,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     program_scheduler: Option<Arc<ProgramScheduler>>,
@@ -84,6 +189,9 @@ impl Router {
     ) -> Result<Self, String> {
         // Update active workers gauge
         RouterMetrics::set_active_workers(worker_urls.len());
+
+        // All-http or all-grpc. Mixed schemes fail here (not a silent fallback).
+        crate::backend::classify_worker_urls(&worker_urls)?;
 
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
         if !worker_urls.is_empty() {
@@ -249,6 +357,10 @@ impl Router {
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
+            health_config,
+            frontend: crate::backend::EngineFrontend::with_request_timeout(Duration::from_secs(
+                ctx.router_config.request_timeout_secs,
+            )),
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
             program_scheduler,
@@ -256,6 +368,11 @@ impl Router {
             program_targets_cache: Mutex::new(HashMap::new()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
         })
+    }
+
+    /// Test hook: pin token ids so gRPC e2e does not load a model.
+    pub fn pin_test_token_ids(&self, token_ids: Vec<u32>) {
+        self.frontend.pin_test_token_ids(token_ids);
     }
 
     fn warn_on_default_program_calibration(config: &crate::config::types::ProgramSchedulingConfig) {
@@ -630,16 +747,25 @@ impl Router {
                 let url_clone = base_url.clone();
 
                 let check_health = tokio::spawn(async move {
-                    let health_url = format!("{}/health", url_clone);
-                    match client_clone.get(&health_url).send().await {
-                        Ok(res) => {
-                            if res.status().is_success() {
-                                None
-                            } else {
-                                Some((url_clone, format!("status: {}", res.status())))
-                            }
+                    if crate::backend::is_grpc_url(&url_clone) {
+                        match crate::backend::check_grpc_health(&url_clone, Duration::from_secs(2))
+                            .await
+                        {
+                            Ok(()) => None,
+                            Err(e) => Some((url_clone, e)),
                         }
-                        Err(_) => Some((url_clone, "not ready".to_string())),
+                    } else {
+                        let health_url = format!("{}/health", url_clone);
+                        match client_clone.get(&health_url).send().await {
+                            Ok(res) => {
+                                if res.status().is_success() {
+                                    None
+                                } else {
+                                    Some((url_clone, format!("status: {}", res.status())))
+                                }
+                            }
+                            Err(_) => Some((url_clone, "not ready".to_string())),
+                        }
                     }
                 });
 
@@ -729,6 +855,14 @@ impl Router {
         } else {
             worker_url
         };
+
+        if crate::backend::is_grpc_url(health_url) {
+            return match crate::backend::check_grpc_health(health_url, Duration::from_secs(2)).await
+            {
+                Ok(()) => StatusCode::OK.into_response(),
+                Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+            };
+        }
 
         let request_builder = self.client.get(format!("{}/health", health_url));
 
@@ -903,6 +1037,50 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
+
+        // Re-check live URLs. Mix is rejected at init / add_worker; this
+        // catches a registry that somehow became mixed.
+        let pool = match crate::backend::classify_worker_urls(&self.get_worker_urls()) {
+            Ok(kind) => kind,
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+            }
+        };
+
+        // All-grpc chat: tokenize once, outside policy and retry.
+        // Policy still uses extract_text_for_routing (session / empty).
+        // token_ids stay on PreparedChat for a later token-level policy —
+        // do not dump 131k ids into the cache_aware tree.
+        let prepared = if matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc))
+            && route == "/v1/chat/completions"
+        {
+            let chat: ChatCompletionRequest =
+                match serde_json::to_value(typed_req).and_then(serde_json::from_value) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("gRPC chat convert failed: {e}"),
+                        )
+                            .into_response();
+                    }
+                };
+            match self.frontend.prepare(chat).await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    let status =
+                        if e.starts_with("tokenizer:") || e.starts_with("sampling defaults:") {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        };
+                    return (status, e).into_response();
+                }
+            }
+        } else {
+            None
+        };
+
         let text = typed_req.extract_text_for_routing();
 
         let response = RetryExecutor::execute_response_with_retry(
@@ -971,12 +1149,15 @@ impl Router {
 
                 let response = self
                     .send_typed_request(
-                        headers,
                         typed_req,
-                        route,
-                        worker.url(),
-                        is_stream,
-                        load_incremented,
+                        TypedDispatch {
+                            headers,
+                            route,
+                            worker_url: worker.url(),
+                            is_stream,
+                            load_incremented,
+                            prepared: prepared.clone(),
+                        },
                         program_completion.clone(),
                     )
                     .await;
@@ -1155,14 +1336,55 @@ impl Router {
     #[allow(clippy::too_many_arguments)]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
-        headers: Option<&HeaderMap>,
         typed_req: &T,
-        route: &str,
-        worker_url: &str,
-        is_stream: bool,
-        load_incremented: bool, // Whether load was incremented for this request
+        dispatch: TypedDispatch<'_>,
         program_completion: Option<ProgramCompletion>,
     ) -> Response {
+        let TypedDispatch {
+            headers,
+            route,
+            worker_url,
+            is_stream,
+            load_incremented,
+            prepared,
+        } = dispatch;
+        if crate::backend::is_grpc_url(worker_url) {
+            // gRPC workers are chat-only in this milestone. Reject unsupported
+            // client routes as request errors so healthy workers are not
+            // penalized by circuit-breaker accounting.
+            if route != "/v1/chat/completions" {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("gRPC backend currently supports /v1/chat/completions, not {route}"),
+                )
+                    .into_response();
+            }
+            let Some(prepared) = prepared else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "gRPC chat requires Frontend.prepare before dispatch",
+                )
+                    .into_response();
+            };
+            let mut response = self.frontend.dispatch(worker_url, prepared).await;
+            if load_incremented
+                && (response.status().is_success() || !is_retryable_status(response.status()))
+            {
+                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
+                    if is_stream && response.status().is_success() {
+                        response = hold_load_until_body_done(response, worker);
+                    } else {
+                        worker.decrement_load();
+                        RouterMetrics::set_running_requests(worker_url, worker.load());
+                    }
+                }
+            }
+            if let Some(completion) = &program_completion {
+                completion.finish(response.status().is_success());
+            }
+            return response;
+        }
+
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
                 let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
@@ -1227,6 +1449,11 @@ impl Router {
             request_builder = request_builder.header("X-data-parallel-rank", dp_rank.to_string());
         }
 
+        // Opt-in: VLLM_ROUTER_STAGES=1. HTTP remains a transparent proxy; the
+        // stage split reports worker header wait and first SSE byte only.
+        let stages_on = crate::backend::stages_enabled();
+
+        let t_send = Instant::now();
         let res = match otel_http::send_client_request(
             request_builder,
             headers,
@@ -1264,10 +1491,17 @@ impl Router {
 
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
 
         if !is_stream {
             // For non-streaming requests, preserve headers
-            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
+            if stages_on {
+                let http_stages = http_stages_json(http_ttfb_ms, first_ms);
+                insert_router_stages(&mut response_headers, &http_stages);
+                info!(stages = %http_stages, "http proxy stages");
+            }
 
             let response = match res.bytes().await {
                 Ok(body) => {
@@ -1320,6 +1554,10 @@ impl Router {
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            if stages_on {
+                let header_stages = http_stages_json(http_ttfb_ms, http_ttfb_ms);
+                insert_router_stages(&mut response_headers, &header_stages);
+            }
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1328,10 +1566,19 @@ impl Router {
             tokio::spawn(async move {
                 let mut stream = stream;
                 let mut decremented = false;
+                let mut first_sse = true;
                 let mut stream_succeeded = true;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            if first_sse {
+                                first_sse = false;
+                                let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
+                                if stages_on {
+                                    let stages = http_stages_json(http_ttfb_ms, first_ms);
+                                    emit_http_first_sse(&tx, &stages);
+                                }
+                            }
                             if let Some(completion) = &completion {
                                 completion.observe_sse_chunk(&bytes);
                             }
@@ -1383,6 +1630,10 @@ impl Router {
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            if stages_on {
+                let header_stages = http_stages_json(http_ttfb_ms, http_ttfb_ms);
+                insert_router_stages(&mut response_headers, &header_stages);
+            }
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1395,10 +1646,19 @@ impl Router {
             // Spawn task to forward stream
             tokio::spawn(async move {
                 let mut stream = stream;
+                let mut first_sse = true;
                 let mut stream_succeeded = true;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            if first_sse {
+                                first_sse = false;
+                                let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
+                                if stages_on {
+                                    let stages = http_stages_json(http_ttfb_ms, first_ms);
+                                    emit_http_first_sse(&tx, &stages);
+                                }
+                            }
                             if let Some(completion) = &completion {
                                 completion.observe_sse_chunk(&bytes);
                             }
@@ -1430,6 +1690,10 @@ impl Router {
     }
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
+        let mut urls = self.get_worker_urls();
+        urls.push(worker_url.to_string());
+        crate::backend::classify_worker_urls(&urls)?;
+
         let start_time = std::time::Instant::now();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.worker_startup_timeout_secs))
@@ -1448,123 +1712,116 @@ impl Router {
                 ));
             }
 
-            match client.get(format!("{}/health", worker_url)).send().await {
-                Ok(res) => {
-                    if res.status().is_success() {
-                        if self.intra_node_data_parallel_size > 1 {
-                            // Expand worker URL into multiple DP-aware URLs based on configured intra_node_data_parallel_size
-                            // (e.g., "http://host:8000" → "http://host:8000@0", "@1", etc.)
-                            // without querying the worker
-                            let url_vec = vec![String::from(worker_url)];
-                            let dp_url_vec = dp_utils::get_dp_aware_workers(
-                                &url_vec,
-                                &self.api_key,
-                                self.intra_node_data_parallel_size,
-                            )
-                            .await
-                            .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?;
-                            let mut worker_added: bool = false;
-                            for dp_url in &dp_url_vec {
-                                if self.worker_registry.get_by_url(dp_url).is_some() {
-                                    warn!("Worker {} already exists", dp_url);
-                                    continue;
-                                }
-                                info!("Added worker: {}", dp_url);
-                                // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-                                let (base_url, dp_rank) = dp_utils::parse_worker_url(dp_url);
-                                let new_worker = DPAwareWorker::new(
-                                    base_url,
-                                    dp_rank.unwrap_or(0),
-                                    self.intra_node_data_parallel_size,
-                                    WorkerType::Regular,
-                                )
-                                .with_circuit_breaker_config(self.circuit_breaker_config.clone());
+            let health_result = if crate::backend::is_grpc_url(worker_url) {
+                crate::backend::check_grpc_health(worker_url, Duration::from_secs(2)).await
+            } else {
+                match client.get(format!("{}/health", worker_url)).send().await {
+                    Ok(res) if res.status().is_success() => Ok(()),
+                    Ok(res) => Err(format!("HTTP health status {}", res.status())),
+                    Err(error) => Err(error.to_string()),
+                }
+            };
 
-                                let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
-                                self.worker_registry.register(worker_arc.clone());
-
-                                // Notify PolicyRegistry about the new worker
-                                let model_id = worker_arc.model_id();
-                                let policy = self.policy_registry.on_worker_added(model_id, None);
-
-                                // If this is a cache-aware policy, update it with all workers for this model
-                                if policy.name() == "cache_aware" {
-                                    if let Some(cache_aware) = policy
-                                        .as_any()
-                                        .downcast_ref::<crate::policies::CacheAwarePolicy>(
-                                    ) {
-                                        let model_workers =
-                                            self.worker_registry.get_by_model_fast(model_id);
-                                        cache_aware.init_workers(&model_workers);
-                                    }
-                                }
-
-                                worker_added = true;
+            match health_result {
+                Ok(()) => {
+                    if self.intra_node_data_parallel_size > 1 {
+                        // Expand worker URL into multiple DP-aware URLs based on configured intra_node_data_parallel_size
+                        // (e.g., "http://host:8000" → "http://host:8000@0", "@1", etc.)
+                        // without querying the worker
+                        let url_vec = vec![String::from(worker_url)];
+                        let dp_url_vec = dp_utils::get_dp_aware_workers(
+                            &url_vec,
+                            &self.api_key,
+                            self.intra_node_data_parallel_size,
+                        )
+                        .await
+                        .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?;
+                        let mut worker_added: bool = false;
+                        for dp_url in &dp_url_vec {
+                            if self.worker_registry.get_by_url(dp_url).is_some() {
+                                warn!("Worker {} already exists", dp_url);
+                                continue;
                             }
-                            if !worker_added {
-                                return Err(format!("No worker added for {}", worker_url));
-                            }
-                        } else {
-                            if self.worker_registry.get_by_url(worker_url).is_some() {
-                                return Err(format!("Worker {} already exists", worker_url));
-                            }
-                            info!("Added worker: {}", worker_url);
-
+                            info!("Added worker: {}", dp_url);
                             // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-                            let new_worker =
-                                BasicWorker::new(worker_url.to_string(), WorkerType::Regular)
-                                    .with_circuit_breaker_config(
-                                        self.circuit_breaker_config.clone(),
-                                    );
+                            let (base_url, dp_rank) = dp_utils::parse_worker_url(dp_url);
+                            let new_worker = DPAwareWorker::new(
+                                base_url,
+                                dp_rank.unwrap_or(0),
+                                self.intra_node_data_parallel_size,
+                                WorkerType::Regular,
+                            )
+                            .with_circuit_breaker_config(self.circuit_breaker_config.clone())
+                            .with_health_config(self.health_config.clone());
 
-                            let worker_arc = Arc::new(new_worker);
+                            let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                             self.worker_registry.register(worker_arc.clone());
 
                             // Notify PolicyRegistry about the new worker
                             let model_id = worker_arc.model_id();
                             let policy = self.policy_registry.on_worker_added(model_id, None);
 
-                            // If this is a cache-aware policy, add this worker to it
+                            // If this is a cache-aware policy, update it with all workers for this model
                             if policy.name() == "cache_aware" {
                                 if let Some(cache_aware) = policy
                                     .as_any()
                                     .downcast_ref::<crate::policies::CacheAwarePolicy>(
                                 ) {
-                                    // Get all workers for this model
                                     let model_workers =
                                         self.worker_registry.get_by_model_fast(model_id);
                                     cache_aware.init_workers(&model_workers);
                                 }
                             }
+
+                            worker_added = true;
                         }
-
-                        RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
-
-                        return Ok(format!("Successfully added worker: {}", worker_url));
+                        if !worker_added {
+                            return Err(format!("No worker added for {}", worker_url));
+                        }
                     } else {
-                        debug!(
-                            "Worker {} health check pending - status: {}",
-                            worker_url,
-                            res.status()
-                        );
-                        // if the url does not have http or https prefix, warn users
-                        if !worker_url.starts_with("http://") && !worker_url.starts_with("https://")
-                        {
-                            warn!("The worker url {} does not have http or https prefix. Please add the prefix to the url.", worker_url);
+                        if self.worker_registry.get_by_url(worker_url).is_some() {
+                            return Err(format!("Worker {} already exists", worker_url));
                         }
+                        info!("Added worker: {}", worker_url);
 
-                        tokio::time::sleep(Duration::from_secs(
-                            self.worker_startup_check_interval_secs,
-                        ))
-                        .await;
-                        continue;
+                        // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
+                        let new_worker =
+                            BasicWorker::new(worker_url.to_string(), WorkerType::Regular)
+                                .with_circuit_breaker_config(self.circuit_breaker_config.clone())
+                                .with_health_config(self.health_config.clone());
+
+                        let worker_arc = Arc::new(new_worker);
+                        self.worker_registry.register(worker_arc.clone());
+
+                        // Notify PolicyRegistry about the new worker
+                        let model_id = worker_arc.model_id();
+                        let policy = self.policy_registry.on_worker_added(model_id, None);
+
+                        // If this is a cache-aware policy, add this worker to it
+                        if policy.name() == "cache_aware" {
+                            if let Some(cache_aware) = policy
+                                .as_any()
+                                .downcast_ref::<crate::policies::CacheAwarePolicy>(
+                            ) {
+                                // Get all workers for this model
+                                let model_workers =
+                                    self.worker_registry.get_by_model_fast(model_id);
+                                cache_aware.init_workers(&model_workers);
+                            }
+                        }
                     }
+
+                    RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
+
+                    return Ok(format!("Successfully added worker: {}", worker_url));
                 }
                 Err(e) => {
                     debug!("Worker {} health check pending - error: {}", worker_url, e);
 
-                    // if the url does not have http or https prefix, warn users
-                    if !worker_url.starts_with("http://") && !worker_url.starts_with("https://") {
+                    if !worker_url.starts_with("http://")
+                        && !worker_url.starts_with("https://")
+                        && !crate::backend::is_grpc_url(worker_url)
+                    {
                         warn!("The worker url {} does not have http or https prefix. Please add the prefix to the url.", worker_url);
                     }
 
@@ -1589,12 +1846,14 @@ impl Router {
             let all_workers = self.worker_registry.get_all();
             for w in all_workers.iter() {
                 if w.url().starts_with(&worker_url_prefix) {
+                    let removed_url = w.url().to_string();
                     // Get model_id before removing
                     let model_id = w.model_id().to_string();
 
-                    if self.worker_registry.remove_by_url(w.url()).is_some() {
-                        info!("Removed worker: {}", w.url());
-                        removed_workers.push(w.url().to_string());
+                    if self.worker_registry.remove_by_url(&removed_url).is_some() {
+                        self.frontend.remove_worker(&removed_url);
+                        info!("Removed worker: {}", removed_url);
+                        removed_workers.push(removed_url);
 
                         // Notify PolicyRegistry about the removed worker
                         self.policy_registry.on_worker_removed(&model_id);
@@ -1632,6 +1891,7 @@ impl Router {
             };
 
             if self.worker_registry.remove_by_url(worker_url).is_some() {
+                self.frontend.remove_worker(worker_url);
                 info!("Removed worker: {}", worker_url);
 
                 // Notify PolicyRegistry about the removed worker
@@ -1856,18 +2116,87 @@ impl RouterTrait for Router {
     }
 
     async fn health_generate(&self, req: Request<Body>) -> Response {
+        match self.select_first_worker() {
+            Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
+                // vLLM Rust gRPC exposes canonical grpc.health.v1 for
+                // readiness. That is not equivalent to /health_generate,
+                // which router HTTP/PD paths treat as a generation-capability
+                // probe, so all-gRPC mode returns an explicit 501.
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
+                    "/health_generate is not implemented for gRPC workers; use /health for gRPC readiness",
+                )
+                    .into_response();
+            }
+            Ok(_) => {}
+            Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+        }
         self.proxy_get_request(req, "health_generate").await
     }
 
     async fn get_server_info(&self, req: Request<Body>) -> Response {
+        match self.select_first_worker() {
+            Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
+                return match crate::backend::get_grpc_server_info(
+                    &worker_url,
+                    Duration::from_secs(2),
+                )
+                .await
+                {
+                    Ok(info) => (
+                        StatusCode::OK,
+                        Json(crate::backend::server_info_json(&info)),
+                    )
+                        .into_response(),
+                    Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+                };
+            }
+            Ok(_) => {}
+            Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+        }
         self.proxy_get_request(req, "get_server_info").await
     }
 
     async fn get_models(&self, req: Request<Body>) -> Response {
+        match self.select_first_worker() {
+            Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
+                return match crate::backend::get_grpc_model_info(
+                    &worker_url,
+                    Duration::from_secs(2),
+                )
+                .await
+                {
+                    Ok(info) => (
+                        StatusCode::OK,
+                        Json(crate::backend::openai_models_json(&info)),
+                    )
+                        .into_response(),
+                    Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+                };
+            }
+            Ok(_) => {}
+            Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+        }
         self.proxy_get_request(req, "v1/models").await
     }
 
     async fn get_model_info(&self, req: Request<Body>) -> Response {
+        match self.select_first_worker() {
+            Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
+                return match crate::backend::get_grpc_model_info(
+                    &worker_url,
+                    Duration::from_secs(2),
+                )
+                .await
+                {
+                    Ok(info) => (StatusCode::OK, Json(crate::backend::model_info_json(&info)))
+                        .into_response(),
+                    Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+                };
+            }
+            Ok(_) => {}
+            Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+        }
         self.proxy_get_request(req, "get_model_info").await
     }
 
@@ -2348,6 +2677,39 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            health_config: HealthConfig::default(),
+            frontend: crate::backend::EngineFrontend::new(),
+            _worker_loads: Arc::new(rx),
+            _load_monitor_handle: None,
+            program_scheduler: None,
+            _program_observation_handle: None,
+            program_targets_cache: Mutex::new(HashMap::new()),
+            program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
+        }
+    }
+
+    fn create_test_grpc_router() -> Router {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::RoundRobin,
+        ));
+
+        let worker = BasicWorker::new("grpc://127.0.0.1:15002".to_string(), WorkerType::Regular);
+        worker_registry.register(Arc::new(worker));
+
+        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
+        Router {
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            health_config: HealthConfig::default(),
+            frontend: crate::backend::EngineFrontend::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             program_scheduler: None,
@@ -2477,6 +2839,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_grpc_health_generate_is_explicitly_not_implemented() {
+        let router = create_test_grpc_router();
+        let response = router.health_generate(Request::new(Body::empty())).await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("not implemented for gRPC workers"));
+    }
+
+    #[tokio::test]
+    async fn test_add_worker_rejects_mixed_scheme() {
+        let router = create_test_regular_router();
+        let err = router
+            .add_worker("grpc://127.0.0.1:50051")
+            .await
+            .unwrap_err();
+        assert!(err.contains("mixed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn streaming_body_holds_load_until_consumed_or_dropped() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "grpc://worker:50051".to_string(),
+            WorkerType::Regular,
+        ));
+
+        worker.increment_load();
+        let response =
+            hold_load_until_body_done(Response::new(Body::from("complete")), worker.clone());
+        assert_eq!(worker.load(), 1);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(worker.load(), 0);
+
+        worker.increment_load();
+        let response =
+            hold_load_until_body_done(Response::new(Body::from("cancelled")), worker.clone());
+        assert_eq!(worker.load(), 1);
+        drop(response);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn grpc_stream_load_follows_producer_and_drop_cancels_it() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "grpc://worker:50051".to_string(),
+            WorkerType::Regular,
+        ));
+
+        worker.increment_load();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let producer = tokio::spawn(async move {
+            let _ = finish_rx.await;
+        });
+        let mut response = Response::new(Body::from("buffered"));
+        response
+            .extensions_mut()
+            .insert(crate::backend::grpc::GrpcStreamTask::new(producer));
+        let response = hold_load_until_body_done(response, worker.clone());
+        finish_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while worker.load() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // The body is still buffered, but backend generation has finished.
+        assert_eq!(worker.load(), 0);
+        drop(response);
+
+        worker.increment_load();
+        let producer = tokio::spawn(std::future::pending::<()>());
+        let mut response = Response::new(Body::from("buffered"));
+        response
+            .extensions_mut()
+            .insert(crate::backend::grpc::GrpcStreamTask::new(producer));
+        let response = hold_load_until_body_done(response, worker.clone());
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while worker.load() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_wait_for_healthy_workers_empty_list() {
         // Empty list will return error immediately
         let result = Router::wait_for_healthy_workers(&[], 1, 1).await;
@@ -2522,6 +2972,8 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            health_config: HealthConfig::default(),
+            frontend: crate::backend::EngineFrontend::new(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             program_scheduler: None,
@@ -2743,7 +3195,10 @@ mod tests {
         use std::sync::Arc;
         use tokio::net::TcpListener;
 
-        let start = std::time::Instant::now();
+        // Start the delay on the first health request, not when the task is
+        // spawned. Under a loaded test runner, spawn-to-request scheduling can
+        // otherwise exceed the delay and make the first assertion flaky.
+        let first_request = Arc::new(std::sync::OnceLock::<std::time::Instant>::new());
         let ready_after = Arc::new(delay);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2753,10 +3208,11 @@ mod tests {
             .route(
                 "/health",
                 get(
-                    move |State((start, ready_after)): State<(
-                        std::time::Instant,
+                    move |State((first_request, ready_after)): State<(
+                        Arc<std::sync::OnceLock<std::time::Instant>>,
                         Arc<std::time::Duration>,
                     )>| async move {
+                        let start = first_request.get_or_init(std::time::Instant::now);
                         if start.elapsed() >= *ready_after {
                             StatusCode::OK
                         } else {
@@ -2765,7 +3221,7 @@ mod tests {
                     },
                 ),
             )
-            .with_state((start, ready_after));
+            .with_state((first_request, ready_after));
 
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();

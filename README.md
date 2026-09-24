@@ -13,6 +13,7 @@ A high-performance and light-weight request forwarding system for vLLM large sca
 - **Prefill-Decode Disaggregation**: Specialized routing for separated processing phases
 - **Service Discovery**: Kubernetes-native worker management and health monitoring
 - **Enterprise Features**: Circuit breakers, retry logic, metrics collection
+- **gRPC workers**: Route to vLLM Rust Inference workers via `grpc://` URLs
 
 ## Quick Start
 
@@ -48,7 +49,7 @@ Install from PyPI
 pip install vllm-router                                                                                                                                                        ```
 
 To build from source:
-```bash    
+```bash
 pip install setuptools-rust wheel build
 python -m build
 pip install dist/*.whl
@@ -272,6 +273,40 @@ vllm-router \
 - `--selector`: Label selectors for regular mode (format: `key1=value1 key2=value2`)
 
 ## Development
+
+### gRPC worker backend
+
+`grpc://` workers speak vLLM’s Rust `Inference` API. HTTP workers remain
+transparent OpenAI reverse proxies; gRPC workers receive router-rendered
+`token_ids` and return a stream that the router adapts back to OpenAI
+chat-completion responses.
+
+See [gRPC backend details](docs/backend/grpc.md) for module boundaries,
+capability limits, vLLM 0.29 launch notes, tests, and troubleshooting.
+
+Quick local launch:
+
+```bash
+./scripts/backend/check_vllm_rs.sh
+# then: export VLLM_RS=...
+"$VLLM_RS" serve "$MODEL" \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --grpc-port 50051 \
+  --tensor-parallel-size 1 \
+  --max-model-len 8192 \
+  --max-num-seqs 16 \
+  --enable-prefix-caching
+vllm-router \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --worker-urls grpc://127.0.0.1:50051
+```
+
+`--max-num-seqs`, `--max-model-len`, and prefix-cache flags are worker
+options. Launch helpers live in [`scripts/backend`](scripts/backend); the
+prefix-KV benchmark client lives at
+[`benches/backend/bench_prefix_kvhit.py`](benches/backend/bench_prefix_kvhit.py).
 
 ### Troubleshooting
 
