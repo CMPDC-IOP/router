@@ -1,3 +1,4 @@
+use super::program_adapter::ProgramCompletion;
 use crate::config::types::RetryConfig;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
@@ -6,6 +7,10 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::program_scheduling::{
+    BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
+    ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
+};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
@@ -13,6 +18,7 @@ use crate::protocols::spec::{
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
+use crate::token_estimator::{MomentumTokenEstimator, TokenEstimateScope};
 use axum::body::to_bytes;
 use axum::{
     body::Body,
@@ -24,6 +30,7 @@ use axum::{
     Json,
 };
 use futures_util::StreamExt;
+use parking_lot::Mutex;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,6 +52,27 @@ pub struct Router {
     circuit_breaker_config: CircuitBreakerConfig,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+    program_scheduler: Option<Arc<ProgramScheduler>>,
+    _program_observation_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+    program_targets_cache: Mutex<HashMap<String, ProgramTargetCacheEntry>>,
+    program_token_estimator: Arc<MomentumTokenEstimator>,
+}
+
+#[derive(Debug, Clone)]
+struct ProgramTargetCacheEntry {
+    registry_revision: u64,
+    targets: Arc<[ProgramTarget]>,
+}
+
+const PROGRAM_MODEL_POOL_ALL: &str = "program:all";
+const PROGRAM_MODEL_POOL_FALLBACK: &str = "program:fallback:unlabeled";
+const PROGRAM_MODEL_POOL_NAMED_PREFIX: &str = "program:model:";
+const UNLABELED_WORKER_MODEL_ID: &str = "unknown";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedProgramModelPool {
+    scheduler_key: String,
+    registry_model: Option<String>,
 }
 
 impl Router {
@@ -167,6 +195,48 @@ impl Router {
             None
         };
 
+        if let Some(config) = ctx.router_config.program_scheduling.as_ref() {
+            Self::warn_on_default_program_calibration(config);
+        }
+        let program_scheduler = ctx
+            .router_config
+            .program_scheduling
+            .as_ref()
+            .map(ProgramSchedulerConfig::from)
+            .map(ProgramScheduler::new)
+            .map(Arc::new);
+        let program_observation_handle = program_scheduler.as_ref().map(|scheduler| {
+            let scheduler = scheduler.clone();
+            let worker_registry = ctx.worker_registry.clone();
+            let provider = VllmMetricsObservationProvider::new(
+                ctx.client.clone(),
+                ctx.router_config.api_key.clone(),
+            );
+            Arc::new(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(scheduler.metrics_interval());
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    Self::sync_program_targets_from_registry(&scheduler, &worker_registry);
+                    let targets = scheduler.all_targets();
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    let epoch = scheduler.begin_observation(&targets);
+                    let (observations, failures) = provider.observe(&targets).await;
+                    for failure in failures {
+                        warn!(
+                            base_url = failure.base_url,
+                            error = failure.error,
+                            "Program scheduling backend observation failed"
+                        );
+                    }
+                    scheduler.apply_observations(epoch, observations);
+                    scheduler.tick();
+                }
+            }))
+        });
+
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
@@ -181,7 +251,287 @@ impl Router {
             circuit_breaker_config: core_cb_config,
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
+            program_scheduler,
+            _program_observation_handle: program_observation_handle,
+            program_targets_cache: Mutex::new(HashMap::new()),
+            program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
         })
+    }
+
+    fn warn_on_default_program_calibration(config: &crate::config::types::ProgramSchedulingConfig) {
+        if config.binding_only {
+            return;
+        }
+        let defaulted_fields = config.defaulted_calibration_fields();
+        if defaulted_fields.is_empty() {
+            return;
+        }
+
+        const REFERENCE_PROMPT_TOKENS: f64 = 50_000.0;
+        const REFERENCE_DECODE_BATCH_SIZE: f64 = 4.0;
+        const REFERENCE_DECODE_CONTEXT_TOKENS_PER_REQUEST: f64 = 50_000.0;
+        const REFERENCE_DECODE_CONTEXT_TOKENS: f64 = 200_000.0;
+        let prompt_1k = REFERENCE_PROMPT_TOKENS / 1_000.0;
+        let prefill = config.prefill_cost_model;
+        let reference_prefill_seconds = prefill.intercept_seconds
+            + prefill.linear_seconds_per_1k_tokens * prompt_1k
+            + prefill.quadratic_seconds_per_1k_tokens_squared * prompt_1k * prompt_1k;
+        let decode = config.decode_throughput_model;
+        let reference_decode_throughput_tokens_per_second = REFERENCE_DECODE_BATCH_SIZE
+            / (decode.fixed_step_seconds
+                + decode.batch_step_seconds_per_request * REFERENCE_DECODE_BATCH_SIZE
+                + decode.context_step_seconds_per_token * REFERENCE_DECODE_CONTEXT_TOKENS);
+
+        warn!(
+            event = "program_scheduling_reference_calibration",
+            defaulted_fields = %defaulted_fields.join(","),
+            reference_prefill_tokens = REFERENCE_PROMPT_TOKENS as u64,
+            reference_prefill_seconds,
+            reference_decode_batch_size = REFERENCE_DECODE_BATCH_SIZE as u64,
+            reference_decode_context_tokens_per_request = REFERENCE_DECODE_CONTEXT_TOKENS_PER_REQUEST as u64,
+            reference_decode_context_tokens = REFERENCE_DECODE_CONTEXT_TOKENS as u64,
+            reference_decode_throughput_tokens_per_second,
+            calibration_docs = "docs/program_scheduling.md#offline-calibration-models",
+            "Program scheduling is using one or more reference calibration coefficients; deployment-specific performance differences may degrade scheduling decisions"
+        );
+    }
+
+    fn program_targets(workers: &[Arc<dyn Worker>]) -> Vec<ProgramTarget> {
+        workers
+            .iter()
+            .filter(|worker| worker.is_available())
+            .map(|worker| {
+                let (base_url, parsed_rank) = dp_utils::parse_worker_url(worker.url());
+                ProgramTarget {
+                    id: worker.url().to_string(),
+                    base_url,
+                    dp_rank: worker.dp_rank().or(parsed_rank),
+                }
+            })
+            .collect()
+    }
+
+    /// Refresh every tracked model pool from one revision-stable registry view.
+    fn sync_program_targets_from_registry(
+        scheduler: &ProgramScheduler,
+        worker_registry: &WorkerRegistry,
+    ) {
+        Self::sync_program_targets_from_registry_with_hook(scheduler, worker_registry, || {});
+    }
+
+    fn sync_program_targets_from_registry_with_hook(
+        scheduler: &ProgramScheduler,
+        worker_registry: &WorkerRegistry,
+        mut after_collection: impl FnMut(),
+    ) {
+        let model_pools = scheduler.model_pools();
+        if model_pools.is_empty() {
+            return;
+        }
+        loop {
+            let revision = worker_registry.revision();
+            let snapshots = model_pools
+                .iter()
+                .map(|model_pool| {
+                    let workers = Self::workers_for_program_model_pool(worker_registry, model_pool);
+                    let targets: Arc<[ProgramTarget]> = Self::program_targets(&workers).into();
+                    (model_pool.clone(), targets)
+                })
+                .collect::<Vec<_>>();
+            if worker_registry.revision() != revision {
+                continue;
+            }
+            after_collection();
+            scheduler.sync_target_snapshots(snapshots);
+            if worker_registry.revision() != revision {
+                continue;
+            }
+            return;
+        }
+    }
+
+    fn resolved_program_model_pool(&self, model_id: Option<&str>) -> ResolvedProgramModelPool {
+        match model_id {
+            Some(model) if self.worker_registry.has_model(model) => ResolvedProgramModelPool {
+                scheduler_key: format!("{PROGRAM_MODEL_POOL_NAMED_PREFIX}{model}"),
+                registry_model: Some(model.to_string()),
+            },
+            Some(_) => ResolvedProgramModelPool {
+                scheduler_key: PROGRAM_MODEL_POOL_FALLBACK.to_string(),
+                registry_model: Some(UNLABELED_WORKER_MODEL_ID.to_string()),
+            },
+            None => ResolvedProgramModelPool {
+                scheduler_key: PROGRAM_MODEL_POOL_ALL.to_string(),
+                registry_model: None,
+            },
+        }
+    }
+
+    fn workers_for_program_model_pool(
+        worker_registry: &WorkerRegistry,
+        model_pool: &str,
+    ) -> Vec<Arc<dyn Worker>> {
+        if model_pool == PROGRAM_MODEL_POOL_ALL {
+            worker_registry.get_all()
+        } else if model_pool == PROGRAM_MODEL_POOL_FALLBACK {
+            worker_registry.get_by_model_fast(UNLABELED_WORKER_MODEL_ID)
+        } else if let Some(model) = model_pool.strip_prefix(PROGRAM_MODEL_POOL_NAMED_PREFIX) {
+            worker_registry.get_by_model_fast(model)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn program_targets_for_model(
+        &self,
+        model_pool: &ResolvedProgramModelPool,
+    ) -> Arc<[ProgramTarget]> {
+        loop {
+            let registry_revision = self.worker_registry.revision();
+            let cache_key = model_pool.scheduler_key.clone();
+            if let Some(entry) = self.program_targets_cache.lock().get(&cache_key) {
+                if entry.registry_revision == registry_revision {
+                    return entry.targets.clone();
+                }
+            }
+            let workers = match model_pool.registry_model.as_deref() {
+                Some(model) => self.worker_registry.get_by_model_fast(model),
+                None => self.worker_registry.get_all(),
+            };
+            let targets: Arc<[ProgramTarget]> = Self::program_targets(&workers).into();
+            if self.worker_registry.revision() != registry_revision {
+                continue;
+            }
+            self.program_targets_cache.lock().insert(
+                cache_key,
+                ProgramTargetCacheEntry {
+                    registry_revision,
+                    targets: targets.clone(),
+                },
+            );
+            return targets;
+        }
+    }
+
+    fn schedule_error_response(error: ScheduleError) -> Response {
+        match error {
+            ScheduleError::InvalidIdentity(_) => {
+                (StatusCode::BAD_REQUEST, error.to_string()).into_response()
+            }
+            ScheduleError::NoTargets => {
+                (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response()
+            }
+            ScheduleError::QueueTimeout => {
+                (StatusCode::TOO_MANY_REQUESTS, error.to_string()).into_response()
+            }
+        }
+    }
+
+    fn program_target_unavailable_response(route: &str) -> Response {
+        RouterMetrics::record_request_error(route, "program_target_unavailable");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Program-bound worker is unavailable",
+        )
+            .into_response()
+    }
+
+    fn should_buffer_transparent_response(is_stream: bool, tracked: bool) -> bool {
+        !is_stream && tracked
+    }
+
+    fn should_proxy_transparent_directly(tracked: bool) -> bool {
+        !tracked
+    }
+
+    async fn acquire_program_completion<T: GenerationRequest>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        model_id: Option<&str>,
+        endpoint: &str,
+    ) -> Result<Option<ProgramCompletion>, ScheduleError> {
+        let Some(scheduler) = &self.program_scheduler else {
+            return Ok(None);
+        };
+        let request = typed_req.extract_program_identity_payload();
+        let model_pool = self.resolved_program_model_pool(model_id);
+        let Some(identity) = ProgramIdentity::from_request_with_enable_key(
+            headers,
+            request.as_ref(),
+            Some(&model_pool.scheduler_key),
+            scheduler.enable_key(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let input_text = typed_req.extract_text_for_program_scheduling();
+        self.acquire_program_completion_for_identity(
+            scheduler,
+            identity,
+            &model_pool,
+            endpoint,
+            &input_text,
+        )
+        .await
+    }
+
+    async fn acquire_program_completion_from_payload(
+        &self,
+        headers: Option<&HeaderMap>,
+        request: Option<&serde_json::Value>,
+        model_id: Option<&str>,
+        endpoint: &str,
+        input_text: &str,
+    ) -> Result<Option<ProgramCompletion>, ScheduleError> {
+        let Some(scheduler) = &self.program_scheduler else {
+            return Ok(None);
+        };
+        let model_pool = self.resolved_program_model_pool(model_id);
+        let Some(identity) = ProgramIdentity::from_request_with_enable_key(
+            headers,
+            request,
+            Some(&model_pool.scheduler_key),
+            scheduler.enable_key(),
+        )?
+        else {
+            return Ok(None);
+        };
+        self.acquire_program_completion_for_identity(
+            scheduler,
+            identity,
+            &model_pool,
+            endpoint,
+            input_text,
+        )
+        .await
+    }
+
+    async fn acquire_program_completion_for_identity(
+        &self,
+        scheduler: &Arc<ProgramScheduler>,
+        identity: ProgramIdentity,
+        model_pool: &ResolvedProgramModelPool,
+        endpoint: &str,
+        input_text: &str,
+    ) -> Result<Option<ProgramCompletion>, ScheduleError> {
+        let (estimated_context_tokens, calibration) = self.program_token_estimator.estimate(
+            TokenEstimateScope::new(&model_pool.scheduler_key, endpoint),
+            input_text,
+        );
+        let targets = self.program_targets_for_model(model_pool);
+        let routing_text = scheduler
+            .uses_cache_aware_binding()
+            .then(|| input_text.to_string());
+        let dispatch = scheduler
+            .acquire_from_snapshot(identity, estimated_context_tokens, targets, routing_text)
+            .await?;
+        Ok(Some(ProgramCompletion::new(
+            scheduler.clone(),
+            dispatch,
+            self.program_token_estimator.clone(),
+            calibration,
+        )))
     }
 
     /// Get the current list of worker URLs
@@ -559,7 +909,32 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
+                // Each backend attempt is a fresh scheduling arrival. The
+                // previous ProgramCompletion finishes exactly once before a
+                // retry invokes this closure again.
+                let program_completion = match self
+                    .acquire_program_completion(headers, typed_req, model_id, route)
+                    .await
+                {
+                    Ok(completion) => completion,
+                    Err(error) => return Self::schedule_error_response(error),
+                };
+                let forced_worker_url = program_completion
+                    .as_ref()
+                    .map(|completion| completion.dispatch().target_id.as_str());
+                let selected_worker = if let Some(target) = forced_worker_url {
+                    let worker = self
+                        .worker_registry
+                        .get_by_url(target)
+                        .filter(|worker| worker.is_available());
+                    let Some(worker) = worker else {
+                        return Self::program_target_unavailable_response(route);
+                    };
+                    Some(worker)
+                } else {
+                    self.select_worker_for_model(model_id, Some(&text), headers)
+                };
+                let worker = match selected_worker {
                     Some(w) => w,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -578,13 +953,14 @@ impl Router {
                     None => self.policy_registry.get_default_policy(),
                 };
 
-                let load_incremented = if policy.name() == "cache_aware" {
-                    worker.increment_load();
-                    RouterMetrics::set_running_requests(worker.url(), worker.load());
-                    true
-                } else {
-                    false
-                };
+                let load_incremented =
+                    if policy.name() == "cache_aware" || program_completion.is_some() {
+                        worker.increment_load();
+                        RouterMetrics::set_running_requests(worker.url(), worker.load());
+                        true
+                    } else {
+                        false
+                    };
 
                 // Keep a clone for potential cleanup on retry
                 let worker_for_cleanup = if load_incremented {
@@ -601,13 +977,18 @@ impl Router {
                         worker.url(),
                         is_stream,
                         load_incremented,
+                        program_completion.clone(),
                     )
                     .await;
 
                 // Client errors (4xx) are not worker failures - only server errors (5xx)
                 // should count against the circuit breaker.
                 let status = response.status();
+                let was_available = worker.is_available();
                 worker.record_outcome(status.is_success() || status.is_client_error());
+                if was_available != worker.is_available() {
+                    self.worker_registry.notify_worker_state_change();
+                }
 
                 // For retryable failures, we need to decrement load since send_typed_request
                 // won't have done it (it only decrements on success or non-retryable failures)
@@ -771,6 +1152,7 @@ impl Router {
     }
 
     // Send typed request directly without conversion
+    #[allow(clippy::too_many_arguments)]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -779,6 +1161,7 @@ impl Router {
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
+        program_completion: Option<ProgramCompletion>,
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -888,6 +1271,9 @@ impl Router {
 
             let response = match res.bytes().await {
                 Ok(body) => {
+                    if let Some(completion) = &program_completion {
+                        completion.observe_json(&body);
+                    }
                     let mut response = Response::new(axum::body::Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
@@ -915,11 +1301,20 @@ impl Router {
                 }
             }
 
+            if let Some(completion) = &program_completion {
+                completion.finish(response.status().is_success());
+            }
+
             response
         } else if load_incremented {
             // For streaming with load tracking, we need to manually decrement when done
             let registry = Arc::clone(&self.worker_registry);
             let worker_url = worker_url.to_string();
+            let completion = if status.is_success() {
+                program_completion
+            } else {
+                None
+            };
 
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -933,9 +1328,13 @@ impl Router {
             tokio::spawn(async move {
                 let mut stream = stream;
                 let mut decremented = false;
+                let mut stream_succeeded = true;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            if let Some(completion) = &completion {
+                                completion.observe_sse_chunk(&bytes);
+                            }
                             // Check for stream end marker
                             if bytes
                                 .as_ref()
@@ -949,10 +1348,12 @@ impl Router {
                                 }
                             }
                             if tx.send(Ok(bytes)).is_err() {
+                                stream_succeeded = false;
                                 break;
                             }
                         }
                         Err(e) => {
+                            stream_succeeded = false;
                             let _ = tx.send(Err(format!("Stream error: {}", e)));
                             break;
                         }
@@ -963,6 +1364,9 @@ impl Router {
                         worker.decrement_load();
                         RouterMetrics::set_running_requests(&worker_url, worker.load());
                     }
+                }
+                if let Some(completion) = &completion {
+                    completion.finish(stream_succeeded);
                 }
             });
 
@@ -982,22 +1386,36 @@ impl Router {
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let completion = if status.is_success() {
+                program_completion
+            } else {
+                None
+            };
 
             // Spawn task to forward stream
             tokio::spawn(async move {
                 let mut stream = stream;
+                let mut stream_succeeded = true;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            if let Some(completion) = &completion {
+                                completion.observe_sse_chunk(&bytes);
+                            }
                             if tx.send(Ok(bytes)).is_err() {
+                                stream_succeeded = false;
                                 break;
                             }
                         }
                         Err(e) => {
+                            stream_succeeded = false;
                             let _ = tx.send(Err(format!("Stream error: {}", e)));
                             break;
                         }
                     }
+                }
+                if let Some(completion) = &completion {
+                    completion.finish(stream_succeeded);
                 }
             });
 
@@ -1410,6 +1828,14 @@ impl RouterTrait for Router {
         self
     }
 
+    fn scheduling_diagnostics(&self) -> Option<serde_json::Value> {
+        let scheduler = self.program_scheduler.as_ref()?;
+        let mut diagnostics = serde_json::to_value(scheduler.diagnostics()).ok()?;
+        diagnostics["token_estimation"] =
+            serde_json::to_value(self.program_token_estimator.diagnostics()).ok()?;
+        Some(diagnostics)
+    }
+
     async fn health(&self, _req: Request<Body>) -> Response {
         let workers = self.worker_registry.get_all();
         let unhealthy_servers: Vec<_> = workers
@@ -1682,25 +2108,54 @@ impl RouterTrait for Router {
                 .into_response();
         }
 
-        let policy = self.policy_registry.get_default_policy();
         let request_text = serde_json::to_string(&body).ok();
-        let request_headers = Self::headers_to_request_headers(headers);
-        let worker_idx = match policy.select_worker_with_headers(
-            &workers,
-            request_text.as_deref(),
-            request_headers.as_ref(),
-        ) {
-            Some(idx) => idx,
-            None => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Failed to select a worker".to_string(),
+        let model_id = body.get("model").and_then(serde_json::Value::as_str);
+        let is_stream = body
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let program_completion = if *method == Method::POST {
+            match self
+                .acquire_program_completion_from_payload(
+                    headers,
+                    Some(&body),
+                    model_id,
+                    path,
+                    request_text.as_deref().unwrap_or_default(),
                 )
-                    .into_response();
+                .await
+            {
+                Ok(completion) => completion,
+                Err(error) => return Self::schedule_error_response(error),
             }
+        } else {
+            None
         };
-
-        let worker: &dyn Worker = workers[worker_idx].as_ref();
+        let worker = if let Some(completion) = &program_completion {
+            self.worker_registry
+                .get_by_url(&completion.dispatch().target_id)
+                .filter(|worker| worker.is_available())
+        } else {
+            let policy = self.policy_registry.get_default_policy();
+            let request_headers = Self::headers_to_request_headers(headers);
+            policy
+                .select_worker_with_headers(
+                    &workers,
+                    request_text.as_deref(),
+                    request_headers.as_ref(),
+                )
+                .and_then(|index| workers.get(index).cloned())
+        };
+        let Some(worker) = worker else {
+            if let Some(completion) = &program_completion {
+                completion.finish(false);
+            }
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Failed to select the Program target".to_string(),
+            )
+                .into_response();
+        };
         let url = worker.endpoint_url(path);
 
         debug!("Transparent proxy: forwarding to {}", url);
@@ -1751,9 +2206,6 @@ impl RouterTrait for Router {
             Ok(response) => {
                 let status = response.status();
                 let headers = response.headers().clone();
-
-                // Stream the response body
-                let body = Body::from_stream(response.bytes_stream());
                 let mut response_builder = Response::builder().status(status.as_u16());
 
                 for (name, value) in headers.iter() {
@@ -1762,20 +2214,107 @@ impl RouterTrait for Router {
                     }
                 }
 
-                match response_builder.body(body) {
-                    Ok(response) => response,
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to build response: {}", e),
-                    )
-                        .into_response(),
+                if !status.is_success() {
+                    if let Some(completion) = &program_completion {
+                        completion.finish(false);
+                    }
+                }
+
+                if Self::should_proxy_transparent_directly(program_completion.is_some()) {
+                    response_builder
+                        .body(Body::from_stream(response.bytes_stream()))
+                        .unwrap_or_else(|error| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to build response: {error}"),
+                            )
+                                .into_response()
+                        })
+                } else if Self::should_buffer_transparent_response(
+                    is_stream,
+                    program_completion.is_some(),
+                ) {
+                    match response.bytes().await {
+                        Ok(bytes) => {
+                            if status.is_success() {
+                                if let Some(completion) = &program_completion {
+                                    completion.observe_json(&bytes);
+                                    completion.finish(true);
+                                }
+                            }
+                            response_builder
+                                .body(Body::from(bytes))
+                                .unwrap_or_else(|error| {
+                                    (
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        format!("Failed to build response: {error}"),
+                                    )
+                                        .into_response()
+                                })
+                        }
+                        Err(error) => {
+                            if status.is_success() {
+                                if let Some(completion) = &program_completion {
+                                    completion.finish(false);
+                                }
+                            }
+                            (
+                                StatusCode::BAD_GATEWAY,
+                                format!("Failed to read backend response: {error}"),
+                            )
+                                .into_response()
+                        }
+                    }
+                } else {
+                    let stream = response.bytes_stream();
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    let completion = status.is_success().then_some(program_completion).flatten();
+                    tokio::spawn(async move {
+                        let mut stream = stream;
+                        let mut stream_ok = true;
+                        while let Some(chunk) = stream.next().await {
+                            match chunk {
+                                Ok(bytes) => {
+                                    if let Some(completion) = &completion {
+                                        completion.observe_sse_chunk(&bytes);
+                                    }
+                                    if tx.send(Ok(bytes)).is_err() {
+                                        stream_ok = false;
+                                        break;
+                                    }
+                                }
+                                Err(error) => {
+                                    stream_ok = false;
+                                    let _ = tx.send(Err(format!("Stream error: {error}")));
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(completion) = completion {
+                            completion.finish(stream_ok);
+                        }
+                    });
+                    response_builder
+                        .body(Body::from_stream(UnboundedReceiverStream::new(rx)))
+                        .unwrap_or_else(|error| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to build response: {error}"),
+                            )
+                                .into_response()
+                        })
                 }
             }
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                format!("Backend request failed: {}", e),
-            )
-                .into_response(),
+            Err(error) => {
+                if let Some(completion) = &program_completion {
+                    completion.finish(false);
+                }
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Backend request failed: {error}"),
+                )
+                    .into_response()
+            }
         }
     }
 }
@@ -1811,7 +2350,109 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
+            program_scheduler: None,
+            _program_observation_handle: None,
+            program_targets_cache: Mutex::new(HashMap::new()),
+            program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
         }
+    }
+
+    #[test]
+    fn program_targets_cache_tracks_worker_registry_revision() {
+        let router = create_test_regular_router();
+        let all_pool = router.resolved_program_model_pool(None);
+        let first = router.program_targets_for_model(&all_pool);
+        let second = router.program_targets_for_model(&all_pool);
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let first_missing_pool = router.resolved_program_model_pool(Some("missing-a"));
+        let second_missing_pool = router.resolved_program_model_pool(Some("missing-b"));
+        assert_eq!(
+            first_missing_pool.scheduler_key,
+            PROGRAM_MODEL_POOL_FALLBACK
+        );
+        assert_eq!(first_missing_pool, second_missing_pool);
+        let first_miss = router.program_targets_for_model(&first_missing_pool);
+        let second_miss = router.program_targets_for_model(&second_missing_pool);
+        assert!(Arc::ptr_eq(&first_miss, &second_miss));
+        assert_eq!(first_miss.len(), 2);
+
+        let literal_unknown = router.resolved_program_model_pool(Some("unknown"));
+        assert_eq!(
+            literal_unknown.scheduler_key,
+            format!("{PROGRAM_MODEL_POOL_NAMED_PREFIX}unknown")
+        );
+        assert_ne!(
+            literal_unknown.scheduler_key,
+            first_missing_pool.scheduler_key
+        );
+        assert_eq!(router.program_targets_for_model(&literal_unknown).len(), 2);
+
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            "http://worker3:8080".to_string(),
+            WorkerType::Regular,
+        )));
+        let third = router.program_targets_for_model(&all_pool);
+        assert!(!Arc::ptr_eq(&first, &third));
+        assert_eq!(third.len(), 3);
+    }
+
+    #[test]
+    fn observation_refreshes_tracked_pools_without_request_arrival() {
+        let registry = WorkerRegistry::new();
+        let mut labels = HashMap::new();
+        labels.insert("model_id".to_string(), "model-a".to_string());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorker::new("http://worker-a:8080".to_string(), WorkerType::Regular)
+                .with_labels(labels),
+        );
+        registry.register(worker.clone());
+
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let named_model_a = format!("{PROGRAM_MODEL_POOL_NAMED_PREFIX}model-a");
+        scheduler.sync_targets(PROGRAM_MODEL_POOL_ALL, &[]);
+        scheduler.sync_targets(&named_model_a, &[]);
+        scheduler.sync_targets(PROGRAM_MODEL_POOL_FALLBACK, &[]);
+        Router::sync_program_targets_from_registry(&scheduler, &registry);
+
+        assert_eq!(scheduler.targets(PROGRAM_MODEL_POOL_ALL).len(), 1);
+        assert_eq!(scheduler.targets(&named_model_a).len(), 1);
+        assert!(scheduler.targets(PROGRAM_MODEL_POOL_FALLBACK).is_empty());
+
+        worker.set_healthy(false);
+        registry.notify_worker_state_change();
+        Router::sync_program_targets_from_registry(&scheduler, &registry);
+        assert!(scheduler.targets(PROGRAM_MODEL_POOL_ALL).is_empty());
+        assert!(scheduler.targets(&named_model_a).is_empty());
+
+        registry.remove_by_url("http://worker-a:8080");
+        Router::sync_program_targets_from_registry(&scheduler, &registry);
+        assert!(scheduler.all_targets().is_empty());
+    }
+
+    #[test]
+    fn observation_refresh_retries_registry_change_across_install_boundary() {
+        let registry = WorkerRegistry::new();
+        let worker_url = "http://worker-a:8080";
+        registry.register(Arc::new(BasicWorker::new(
+            worker_url.to_string(),
+            WorkerType::Regular,
+        )));
+
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        scheduler.sync_targets(PROGRAM_MODEL_POOL_ALL, &[]);
+
+        let mut removed = false;
+        Router::sync_program_targets_from_registry_with_hook(&scheduler, &registry, || {
+            if !removed {
+                registry.remove_by_url(worker_url);
+                removed = true;
+            }
+        });
+
+        assert!(removed);
+        assert!(scheduler.targets(PROGRAM_MODEL_POOL_ALL).is_empty());
+        assert!(scheduler.all_targets().is_empty());
     }
 
     #[test]
@@ -1883,6 +2524,10 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
+            program_scheduler: None,
+            _program_observation_handle: None,
+            program_targets_cache: Mutex::new(HashMap::new()),
+            program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
         }
     }
 
@@ -1909,6 +2554,14 @@ mod tests {
         // Test that None headers produce None output
         let result = Router::headers_to_request_headers(None);
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn program_target_unavailable_has_distinct_retryable_response() {
+        let response = Router::program_target_unavailable_response("/v1/chat/completions");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body, "Program-bound worker is unavailable");
     }
 
     #[test]
@@ -2200,6 +2853,7 @@ mod tests {
         );
 
         // ── Step 3: start background health checker (mirrors PdRouterBase::new) ──
+        let revision_before_recovery = registry.revision();
         let health_checker = registry.start_health_checker(1);
 
         // ── Step 4: wait for delayed worker to recover ──
@@ -2219,6 +2873,7 @@ mod tests {
             delayed_worker.is_healthy(),
             "Delayed worker should have transitioned to healthy via health checker"
         );
+        assert!(registry.revision() > revision_before_recovery);
 
         health_checker.shutdown().await;
     }

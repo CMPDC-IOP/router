@@ -56,6 +56,9 @@ class RouterArgs:
     vllm_discovery_address: Optional[str] = None
     # KV connector for PD disaggregation (nixl pull-based or mooncake push-based)
     kv_connector: str = "nixl"
+    # Explicit Program-level scheduling switch and optional JSON overrides.
+    enable_program_scheduling: bool = False
+    program_scheduling_config_json: Optional[str] = None
     # Prometheus configuration
     prometheus_port: Optional[int] = None
     prometheus_host: Optional[str] = None
@@ -130,6 +133,20 @@ class RouterArgs:
             nargs="*",
             default=[],
             help="List of worker URLs (e.g., http://worker1:8000 http://worker2:8000)",
+        )
+
+        parser.add_argument(
+            f"--{prefix}enable-program-scheduling",
+            action="store_true",
+            default=False,
+            help="Enable Program-level scheduling",
+        )
+
+        parser.add_argument(
+            f"--{prefix}program-scheduling-config-json",
+            type=str,
+            default=None,
+            help="JSON object overriding Program-level scheduling defaults (requires the enable flag)",
         )
 
         # Routing policy configuration
