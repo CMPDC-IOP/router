@@ -2,13 +2,18 @@
 
 use axum::{
     body::Body,
-    extract::Request,
-    http::{Method, StatusCode},
-    routing::post,
-    Router,
+    extract::{Request, State},
+    http::{header::CONTENT_TYPE, Method, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
 };
-use serde_json::json;
-use std::sync::Arc;
+use serde_json::{json, Value};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
+use tokio::task::JoinHandle;
 use tower::ServiceExt;
 use vllm_router_rs::{
     config::{RouterConfig, RoutingMode},
@@ -16,7 +21,7 @@ use vllm_router_rs::{
         ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, PromptInput,
         UserMessageContent,
     },
-    routers::{openai_router::OpenAIRouter, RouterTrait},
+    routers::{openai_router::OpenAIRouter, RouterFactory, RouterTrait},
 };
 
 mod common;
@@ -470,4 +475,161 @@ async fn test_openai_router_chat_with_reasoning_fields() {
 
     // Verify it's a valid chat completion response
     assert_eq!(chat_response["object"], "chat.completion");
+}
+type CapturedRequests = Arc<Mutex<Vec<Value>>>;
+
+struct RouterFixture {
+    router: Box<dyn RouterTrait>,
+    requests: CapturedRequests,
+    upstream: JoinHandle<()>,
+}
+
+impl RouterFixture {
+    async fn start() -> Self {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route("/v1/chat/completions", post(capture_chat_request))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec![format!("http://{addr}")],
+            },
+            worker_startup_timeout_secs: 2,
+            worker_startup_check_interval_secs: 1,
+            ..Default::default()
+        };
+        let context = common::create_test_context(config);
+        let router = RouterFactory::create_router(&context).await.unwrap();
+
+        Self {
+            router,
+            requests,
+            upstream,
+        }
+    }
+
+    fn requests(&self) -> Vec<Value> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for RouterFixture {
+    fn drop(&mut self) {
+        self.upstream.abort();
+    }
+}
+
+async fn capture_chat_request(
+    State(requests): State<CapturedRequests>,
+    Json(request): Json<Value>,
+) -> Response {
+    requests.lock().unwrap().push(request.clone());
+
+    if request["stream"] == true {
+        return (
+            [(CONTENT_TYPE, "text/event-stream")],
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+        )
+            .into_response();
+    }
+
+    let has_tool_result = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["role"] == "tool");
+    let response = if has_tool_result {
+        json!({"choices":[{"message":{"role":"assistant","content":"42"},"finish_reason":"stop"}]})
+    } else {
+        json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"exec","arguments":"{\"operation\":\"add\",\"left\":20,\"right\":22}"}}]},"finish_reason":"tool_calls"}]})
+    };
+    Json(response).into_response()
+}
+
+fn function_request(stream: bool) -> Value {
+    json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Add 20 and 22."}],
+        "stream": stream,
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "tools": [
+            {"type":"function","function":{"name":"exec","parameters":{"type":"object"},"strict":true}},
+            {"type":"function","function":{"name":"optional","parameters":{"type":"object"},"strict":false}},
+            {"type":"function","function":{"name":"legacy","parameters":{"type":"object"}}}
+        ]
+    })
+}
+
+fn assert_tools_forwarded(request: &Value) {
+    let expected = function_request(false);
+    assert_eq!(request["tools"], expected["tools"]);
+    assert_eq!(request["tool_choice"], "auto");
+    assert_eq!(request["parallel_tool_calls"], false);
+}
+
+#[tokio::test]
+async fn function_strict_is_forwarded_and_tool_result_can_continue() {
+    let fixture = RouterFixture::start().await;
+    let initial_value = function_request(false);
+    let initial: ChatCompletionRequest = serde_json::from_value(initial_value.clone()).unwrap();
+
+    let first = fixture.router.route_chat(None, &initial, None).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let first: Value = serde_json::from_slice(&first_body).unwrap();
+    let message = &first["choices"][0]["message"];
+    let tool_call = &message["tool_calls"][0];
+    assert_eq!(tool_call["function"]["name"], "exec");
+
+    // Execute only this fixed, controlled fixture operation.
+    let args: Value =
+        serde_json::from_str(tool_call["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args["operation"], "add");
+    let result = args["left"].as_i64().unwrap() + args["right"].as_i64().unwrap();
+    assert_eq!(result, 42);
+
+    let mut continuation_value = initial_value;
+    let messages = continuation_value["messages"].as_array_mut().unwrap();
+    messages.push(message.clone());
+    messages
+        .push(json!({"role":"tool","tool_call_id":tool_call["id"],"content":result.to_string()}));
+    let continuation: ChatCompletionRequest = serde_json::from_value(continuation_value).unwrap();
+    let final_response = fixture.router.route_chat(None, &continuation, None).await;
+    let final_body = axum::body::to_bytes(final_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let final_response: Value = serde_json::from_slice(&final_body).unwrap();
+    assert_eq!(final_response["choices"][0]["message"]["content"], "42");
+
+    let mut streaming_value = function_request(true);
+    streaming_value["tools"] = function_request(false)["tools"].clone();
+    let streaming: ChatCompletionRequest = serde_json::from_value(streaming_value).unwrap();
+    let stream_response = fixture.router.route_chat(None, &streaming, None).await;
+    let stream_body = axum::body::to_bytes(stream_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8(stream_body.to_vec())
+        .unwrap()
+        .contains("[DONE]"));
+
+    let forwarded = fixture.requests();
+    assert_eq!(forwarded.len(), 3);
+    for request in &forwarded {
+        assert_tools_forwarded(request);
+    }
+    assert_eq!(forwarded[0]["stream"], false);
+    assert_eq!(forwarded[2]["stream"], true);
+    let continued_messages = forwarded[1]["messages"].as_array().unwrap();
+    assert_eq!(continued_messages.last().unwrap()["role"], "tool");
+    assert_eq!(continued_messages.last().unwrap()["content"], "42");
 }
