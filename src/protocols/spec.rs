@@ -1837,6 +1837,11 @@ pub struct Function {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub parameters: Value, // JSON Schema
+    /// Whether the function arguments must conform to `parameters`.
+    /// `Option<bool>` preserves the distinction between explicit true/false
+    /// and an omitted value when proxying chat completion requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
