@@ -161,6 +161,13 @@ pub trait Worker: Send + Sync + fmt::Debug {
         format!("{}{}", self.base_url(), route)
     }
 
+    /// Render capability cached for this worker instance and endpoint.
+    /// Failed probes leave the cell uninitialized; confirmed unavailability
+    /// can downgrade a previously supported endpoint without another probe.
+    fn http_render_support(&self, _path: &str) -> Option<&tokio::sync::OnceCell<AtomicBool>> {
+        None
+    }
+
     /// Check if this worker can handle a specific request
     fn can_handle(&self, _req: &serde_json::Value) -> bool {
         true
@@ -310,6 +317,7 @@ pub struct BasicWorker {
     consecutive_failures: Arc<AtomicUsize>,
     consecutive_successes: Arc<AtomicUsize>,
     circuit_breaker: CircuitBreaker,
+    http_render_support: Arc<[tokio::sync::OnceCell<AtomicBool>; 3]>,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -352,6 +360,7 @@ impl BasicWorker {
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: CircuitBreaker::new(),
+            http_render_support: Arc::new(std::array::from_fn(|_| tokio::sync::OnceCell::new())),
         }
     }
 
@@ -406,6 +415,13 @@ impl BasicWorker {
 
 #[async_trait]
 impl Worker for BasicWorker {
+    fn http_render_support(&self, path: &str) -> Option<&tokio::sync::OnceCell<AtomicBool>> {
+        crate::backend::preprocess::HTTP_RENDER_PATHS
+            .iter()
+            .position(|candidate| *candidate == path)
+            .map(|index| &self.http_render_support[index])
+    }
+
     fn url(&self) -> &str {
         &self.metadata.url
     }
@@ -582,6 +598,10 @@ impl DPAwareWorker {
 
 #[async_trait]
 impl Worker for DPAwareWorker {
+    fn http_render_support(&self, path: &str) -> Option<&tokio::sync::OnceCell<AtomicBool>> {
+        self.base_worker.http_render_support(path)
+    }
+
     fn url(&self) -> &str {
         self.base_worker.url()
     }

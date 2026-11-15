@@ -7,7 +7,10 @@ use crate::policies::WorkerTokenInputs;
 use http::HeaderMap;
 use reqwest::Client;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -30,6 +33,12 @@ use vllm_chat::{
     AssistantContentBlock, AssistantToolCall, ChatTool, ChatToolChoice,
     ReasoningEffort as VllmReasoningEffort,
 };
+
+pub(crate) const HTTP_RENDER_PATHS: [&str; 3] = [
+    "/v1/chat/completions/render",
+    "/v1/completions/render",
+    "/v1/responses/render",
+];
 
 /// HTTP routing uses the worker's own render contract, not the gRPC model
 /// frontend: HTTP workers can have different templates and tokenizer settings.
@@ -185,7 +194,7 @@ pub(crate) fn router_token_inputs(
 
 pub(crate) async fn prepare_http_token_inputs(
     client: &Client,
-    mut urls: Vec<String>,
+    mut workers: Vec<Arc<dyn Worker>>,
     body: &serde_json::Value,
     route: &str,
     headers: Option<&HeaderMap>,
@@ -193,8 +202,12 @@ pub(crate) async fn prepare_http_token_inputs(
     budget: Duration,
 ) -> std::collections::HashMap<String, Result<HttpTokenInput, &'static str>> {
     use futures_util::{stream, StreamExt};
-    urls.sort();
-    urls.dedup();
+    workers.sort_by(|a, b| a.base_url().cmp(b.base_url()));
+    workers.dedup_by(|a, b| a.base_url() == b.base_url());
+    let urls: Vec<_> = workers
+        .iter()
+        .map(|worker| worker.base_url().to_owned())
+        .collect();
     let input = match http_kv_input(body, route) {
         Ok(input) => input,
         Err(reason) => return urls.into_iter().map(|url| (url, Err(reason))).collect(),
@@ -233,44 +246,53 @@ pub(crate) async fn prepare_http_token_inputs(
         .iter()
         .map(|url| (url.clone(), Err("preparation_unavailable")))
         .collect();
-    let results = stream::iter(urls)
-        .map(|url| {
-            let tokenize_fallback = &tokenize_fallback;
+    let tokenize_fallback = &tokenize_fallback;
+    let results = stream::iter(workers)
+        .map(move |worker: Arc<dyn Worker>| {
+            let url = worker.base_url().to_owned();
             async move {
-                let result = async {
-                    let (prompts, source) =
-                        match http_input_json(client, &url, path, body, headers, api_key).await {
-                            Ok(rendered) => (http_rendered_tokens(&rendered)?, "render"),
-                            Err("render_unavailable") => {
-                                let requests = tokenize_fallback
-                                    .get_or_init(|| http_tokenize_fallback(body, route))
-                                    .as_ref()
-                                    .ok_or("render_unavailable")?;
-                                let mut prompts = Vec::with_capacity(requests.len());
-                                for request in requests {
-                                    let tokenized = http_input_json(
-                                        client,
-                                        &url,
-                                        "/tokenize",
-                                        request,
-                                        headers,
-                                        api_key,
-                                    )
-                                    .await?;
-                                    let ids = dense_token_ids(&tokenized["tokens"])?;
-                                    if tokenized["count"].as_u64() != Some(ids.len() as u64)
-                                        || tokenized["max_model_len"]
-                                            .as_u64()
-                                            .is_some_and(|limit| ids.len() as u64 > limit)
-                                    {
-                                        return Err("invalid_preparation_response");
-                                    }
-                                    prompts.push(ids);
+                let result = async move {
+                    let (prompts, source) = match http_input_json(
+                        client,
+                        worker.as_ref(),
+                        path,
+                        body,
+                        headers,
+                        api_key,
+                    )
+                    .await
+                    {
+                        Ok(rendered) => (http_rendered_tokens(&rendered)?, "render"),
+                        Err("render_unavailable") => {
+                            let requests = tokenize_fallback
+                                .get_or_init(|| http_tokenize_fallback(body, route))
+                                .as_ref()
+                                .ok_or("render_unavailable")?;
+                            let mut prompts = Vec::with_capacity(requests.len());
+                            for request in requests {
+                                let tokenized = http_input_json(
+                                    client,
+                                    worker.as_ref(),
+                                    "/tokenize",
+                                    request,
+                                    headers,
+                                    api_key,
+                                )
+                                .await?;
+                                let ids = dense_token_ids(&tokenized["tokens"])?;
+                                if tokenized["count"].as_u64() != Some(ids.len() as u64)
+                                    || tokenized["max_model_len"]
+                                        .as_u64()
+                                        .is_some_and(|limit| ids.len() as u64 > limit)
+                                {
+                                    return Err("invalid_preparation_response");
                                 }
-                                (Arc::from(prompts), "tokenize")
+                                prompts.push(ids);
                             }
-                            Err(reason) => return Err(reason),
-                        };
+                            (Arc::from(prompts), "tokenize")
+                        }
+                        Err(reason) => return Err(reason),
+                    };
                     if prompts.len() != expected_prompts {
                         return Err("invalid_preparation_response");
                     }
@@ -280,7 +302,8 @@ pub(crate) async fn prepare_http_token_inputs(
                 (url, result)
             }
         })
-        .buffer_unordered(8);
+        .buffer_unordered(8)
+        .boxed();
     futures_util::pin_mut!(results);
     let deadline = tokio::time::Instant::now() + budget;
     while let Ok(Some((url, result))) = tokio::time::timeout_at(deadline, results.next()).await {
@@ -289,14 +312,104 @@ pub(crate) async fn prepare_http_token_inputs(
     inputs
 }
 
+/// Warm optional render capabilities before serving requests. Failures are
+/// retryable on first use, especially when only callers have worker credentials.
+pub(crate) async fn warm_http_render_support(
+    client: &Client,
+    workers: &[Arc<dyn Worker>],
+    api_key: Option<&str>,
+) {
+    use futures_util::{stream, StreamExt};
+    let probes = stream::iter(workers.iter().filter(|worker| {
+        worker.connection_mode() == crate::core::ConnectionMode::Http && worker.is_healthy()
+    }))
+    .for_each_concurrent(8, |worker| async move {
+        for path in HTTP_RENDER_PATHS {
+            let _ = http_render_available(client, worker.as_ref(), path, None, api_key).await;
+        }
+    });
+    // Capability discovery is optional and must not stall worker registration.
+    let _ = tokio::time::timeout(Duration::from_secs(1), probes).await;
+}
+
+async fn http_render_available(
+    client: &Client,
+    worker: &dyn Worker,
+    path: &str,
+    headers: Option<&HeaderMap>,
+    api_key: Option<&str>,
+) -> Result<bool, &'static str> {
+    let probe = async move {
+        // Enabled handlers reject this non-object JSON during schema validation.
+        // Disabled handlers reject without receiving a large request upload.
+        match http_request_json(
+            client,
+            worker.base_url(),
+            path,
+            &serde_json::json!([]),
+            headers,
+            api_key,
+            true,
+        )
+        .await
+        {
+            Ok(_) => Ok(AtomicBool::new(true)),
+            Err("render_unavailable") => Ok(AtomicBool::new(false)),
+            Err(reason) => Err(reason),
+        }
+    };
+    match worker.http_render_support(path) {
+        Some(cell) => Ok(cell
+            .get_or_try_init(|| probe)
+            .await?
+            .load(Ordering::Acquire)),
+        None => Ok(probe.await?.into_inner()),
+    }
+}
+
 async fn http_input_json(
-    client: &reqwest::Client,
+    client: &Client,
+    worker: &dyn Worker,
+    path: &str,
+    body: &serde_json::Value,
+    headers: Option<&HeaderMap>,
+    api_key: Option<&str>,
+) -> Result<serde_json::Value, &'static str> {
+    if path.ends_with("/render")
+        && !http_render_available(client, worker, path, headers, api_key).await?
+    {
+        return Err("render_unavailable");
+    }
+    let result = http_request_json(
+        client,
+        worker.base_url(),
+        path,
+        body,
+        headers,
+        api_key,
+        false,
+    )
+    .await;
+    if result.as_ref().err() == Some(&"render_unavailable") {
+        // A restarted backend can lose render support at the same URL. Stop
+        // sending full bodies after the first confirmed unavailable response.
+        if let Some(support) = worker.http_render_support(path).and_then(|cell| cell.get()) {
+            support.store(false, Ordering::Release);
+        }
+    }
+    result
+}
+
+async fn http_request_json(
+    client: &Client,
     base: &str,
     path: &str,
     body: &serde_json::Value,
-    headers: Option<&http::HeaderMap>,
+    headers: Option<&HeaderMap>,
     api_key: Option<&str>,
+    probe: bool,
 ) -> Result<serde_json::Value, &'static str> {
+    let is_render = path.ends_with("/render");
     let mut request = client
         .post(format!("{}{path}", base.trim_end_matches('/')))
         .timeout(std::time::Duration::from_secs(5))
@@ -310,12 +423,59 @@ async fn http_input_json(
         .send()
         .await
         .map_err(|_| "preparation_unavailable")?;
-    match response.status() {
-        reqwest::StatusCode::NOT_FOUND
-        | reqwest::StatusCode::METHOD_NOT_ALLOWED
-        | reqwest::StatusCode::NOT_IMPLEMENTED => return Err("render_unavailable"),
-        status if !status.is_success() => return Err("preparation_rejected"),
-        _ => {}
+    let status = response.status();
+    if probe
+        && (status.is_success()
+            || matches!(
+                status,
+                reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            ))
+    {
+        // Drain the small validation response for normal connection reuse.
+        // Its contents are never used as this request's token evidence.
+        response
+            .bytes()
+            .await
+            .map_err(|_| "preparation_unavailable")?;
+        return Ok(serde_json::Value::Null);
+    }
+    if is_render
+        && matches!(
+            status,
+            reqwest::StatusCode::NOT_FOUND
+                | reqwest::StatusCode::METHOD_NOT_ALLOWED
+                | reqwest::StatusCode::NOT_IMPLEMENTED
+        )
+    {
+        return Err("render_unavailable");
+    }
+    if !status.is_success() {
+        if is_render && status == reqwest::StatusCode::FORBIDDEN {
+            use futures_util::TryStreamExt;
+            let body = response
+                .bytes_stream()
+                .map_err(|_| ())
+                .try_fold(Vec::new(), |mut body, chunk| async move {
+                    if body.len() + chunk.len() > 4096 {
+                        return Err(());
+                    }
+                    body.extend_from_slice(&chunk);
+                    Ok(body)
+                })
+                .await;
+            if let Ok(body) = body {
+                if let Ok(error) = serde_json::from_slice::<serde_json::Value>(&body) {
+                    let error = &error["error"];
+                    if error["type"] == "PermissionDeniedError"
+                        && error["code"] == 403
+                        && error["message"] == "Scale-out endpoints are disabled. Restart vllm serve with --enable-scale-out to enable them."
+                    {
+                        return Err("render_unavailable");
+                    }
+                }
+            }
+        }
+        return Err("preparation_rejected");
     }
     response
         .json()
@@ -339,6 +499,8 @@ pub(crate) fn http_tokenize_fallback(
         "response_format",
         "reasoning_effort",
         "documents",
+        // vLLM can replace chat input with these prefill IDs; /tokenize cannot.
+        "kv_transfer_params",
     ] {
         if body.get(field).is_some_and(|value| !value.is_null()) {
             return None;
@@ -475,12 +637,16 @@ pub(crate) async fn prepare_http_kv_inputs(
     api_key: Option<&str>,
     budget: Duration,
 ) -> WorkerTokenInputs {
-    let urls = workers
-        .iter()
-        .map(|worker| worker.base_url().to_owned())
-        .collect();
-    let results =
-        prepare_http_token_inputs(client, urls, body, route, headers, api_key, budget).await;
+    let results = prepare_http_token_inputs(
+        client,
+        workers.to_vec(),
+        body,
+        route,
+        headers,
+        api_key,
+        budget,
+    )
+    .await;
     let mut inputs = WorkerTokenInputs::new();
     for (url, result) in results {
         match result {
@@ -963,6 +1129,14 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[path = "preprocess_http_tests.rs"]
+mod http_tests;
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[path = "preprocess_contract_tests.rs"]
+mod contract_tests;
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     #[test]
     fn router_tokens_refuse_adapter_cache_identities() {
@@ -992,16 +1166,19 @@ mod tests {
     #[tokio::test]
     async fn shared_http_preparation_retains_good_workers_and_exact_tool_payloads() {
         use super::prepare_http_token_inputs;
-        use axum::{routing::post, Json, Router};
+        use axum::{response::IntoResponse, routing::post, Json, Router};
         use serde_json::json;
         let app = Router::new()
             .route(
                 "/good/v1/chat/completions/render",
                 post(|Json(body): Json<serde_json::Value>| async move {
+                    if body.is_array() {
+                        return axum::http::StatusCode::UNPROCESSABLE_ENTITY.into_response();
+                    }
                     assert_eq!(body["tools"], json!([]));
                     assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call-1");
                     assert_eq!(body["truncate_prompt_tokens"], 3);
-                    Json(json!({"token_ids":[7,8,9]}))
+                    Json(json!({"token_ids":[7,8,9]})).into_response()
                 }),
             )
             .route(
@@ -1017,7 +1194,15 @@ mod tests {
             "tools":[],"truncate_prompt_tokens":3});
         let results = prepare_http_token_inputs(
             &reqwest::Client::new(),
-            vec![good.clone(), bad.clone()],
+            [good.clone(), bad.clone()]
+                .into_iter()
+                .map(|url| {
+                    Arc::new(crate::core::BasicWorker::new(
+                        url,
+                        crate::core::WorkerType::Regular,
+                    )) as Arc<dyn Worker>
+                })
+                .collect(),
             &body,
             "/v1/chat/completions",
             None,

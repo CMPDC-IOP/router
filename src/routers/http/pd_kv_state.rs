@@ -454,7 +454,7 @@ impl PdKvState {
             None => {
                 prepare_http_token_inputs(
                     &self.client,
-                    bases,
+                    workers.to_vec(),
                     request,
                     route,
                     headers,

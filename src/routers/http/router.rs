@@ -1,7 +1,9 @@
 use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
 use super::program_adapter::ProgramCompletion;
 use crate::backend::health::check_grpc_health_within;
-use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
+use crate::backend::preprocess::{
+    prepare_completion_direct_inputs, prepare_http_kv_inputs, warm_http_render_support,
+};
 use crate::backend::{
     stream_output::{output_frame_tracking, OutputFrameConsumer, OutputFrameProducer},
     PrepareError,
@@ -528,6 +530,7 @@ impl Router {
             } else {
                 (None, None)
             };
+        let mut render_probe_workers = Vec::new();
         for url in &worker_urls {
             // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
             // For now, create worker without model_id
@@ -583,6 +586,9 @@ impl Router {
             // Notify PolicyRegistry about the new worker
             let model_id = worker_arc.model_id();
             let policy = ctx.policy_registry.on_worker_added(model_id, None);
+            if policy.needs_cache_routing_key() || kv_aware_ops(policy.as_ref()).is_some() {
+                render_probe_workers.push(worker_arc.clone());
+            }
 
             // If this is a cache-aware policy and it's the first worker for this model,
             // initialize it with the worker
@@ -722,6 +728,13 @@ impl Router {
                 }
             }))
         });
+
+        warm_http_render_support(
+            &ctx.client,
+            &render_probe_workers,
+            ctx.router_config.api_key.as_deref(),
+        )
+        .await;
 
         Ok(Router {
             epd: ctx
@@ -2497,6 +2510,7 @@ impl Router {
 
             match health_result {
                 Ok(()) => {
+                    let mut render_probe_workers = Vec::new();
                     if self.intra_node_data_parallel_size > 1 {
                         // Expand worker URL into multiple DP-aware URLs based on configured intra_node_data_parallel_size
                         // (e.g., "http://host:8000" → "http://host:8000@0", "@1", etc.)
@@ -2541,6 +2555,11 @@ impl Router {
                             // Notify PolicyRegistry about the new worker
                             let model_id = worker_arc.model_id();
                             let policy = self.policy_registry.on_worker_added(model_id, None);
+                            if policy.needs_cache_routing_key()
+                                || kv_aware_ops(policy.as_ref()).is_some()
+                            {
+                                render_probe_workers.push(worker_arc.clone());
+                            }
 
                             // If this is a cache-aware policy, update it with all workers for this model
                             if policy.needs_cache_routing_key() {
@@ -2573,13 +2592,18 @@ impl Router {
                                 .with_health_config(self.health_config.clone())
                                 .with_worker_api_key(worker_api_key.clone());
 
-                        let worker_arc = Arc::new(new_worker);
+                        let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                         self.worker_registry.register(worker_arc.clone());
                         self.register_kv_target(worker_arc.as_ref(), kv_info.as_ref());
 
                         // Notify PolicyRegistry about the new worker
                         let model_id = worker_arc.model_id();
                         let policy = self.policy_registry.on_worker_added(model_id, None);
+                        if policy.needs_cache_routing_key()
+                            || kv_aware_ops(policy.as_ref()).is_some()
+                        {
+                            render_probe_workers.push(worker_arc.clone());
+                        }
 
                         // If this is a cache-aware policy, add this worker to it
                         if policy.needs_cache_routing_key() {
@@ -2595,6 +2619,12 @@ impl Router {
                         }
                     }
 
+                    warm_http_render_support(
+                        &self.client,
+                        &render_probe_workers,
+                        self.api_key.as_deref(),
+                    )
+                    .await;
                     RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
 
                     return Ok(format!("Successfully added worker: {}", worker_url));
@@ -4926,6 +4956,10 @@ mod tests {
                 let fail_first = fail_first.clone();
                 async move {
                     let path = uri.path().to_string();
+                    // vLLM validates typed render requests before the handler runs.
+                    if render_available && path.ends_with("/render") && body.is_array() {
+                        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+                    }
                     captured.lock().push((worker_index, path.clone(), body));
                     if path.ends_with("/render") {
                         if prompts.is_empty() {
