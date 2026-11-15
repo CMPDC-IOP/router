@@ -344,10 +344,8 @@ impl PdKvState {
                 .map(|worker| worker.base_url().to_owned())
                 .collect()
         };
-        let prefill_bases = bases(prefill_workers);
-        let decode_bases = bases(decode_workers);
-        let mut all_bases = prefill_bases.clone();
-        all_bases.extend(decode_bases.iter().cloned());
+        let mut all_bases = bases(prefill_workers);
+        all_bases.extend(bases(decode_workers));
         let allow_credit = self.credit_by_base(&all_bases, request).await;
         // Decide whether any Decode candidate can be credited *before* rendering: a salted
         // request, an unverified identity or a pool that publishes no events all end with
@@ -368,10 +366,10 @@ impl PdKvState {
             && !decode_requires_render
             && self.all_priceable(decode_workers, request, &allow_credit);
         let (prefill_results, decode_results) = tokio::join!(
-            self.tokenize(prefill_bases, request, route, headers, router_prompts),
+            self.tokenize(prefill_workers, request, route, headers, router_prompts),
             async {
                 if decode_priced_here {
-                    self.tokenize(decode_bases, request, route, headers, router_prompts)
+                    self.tokenize(decode_workers, request, route, headers, router_prompts)
                         .await
                 } else {
                     HashMap::new()
@@ -416,18 +414,22 @@ impl PdKvState {
     /// Render the request against each base, or reuse the router's own ids.
     async fn tokenize(
         &self,
-        bases: Vec<String>,
+        workers: &[Arc<dyn Worker>],
         request: &Value,
         route: &str,
         headers: Option<&HeaderMap>,
         router_prompts: Option<&Arc<[Vec<u32>]>>,
     ) -> HashMap<String, Result<crate::backend::preprocess::HttpTokenInput, &'static str>> {
         match router_prompts {
-            Some(prompts) => router_token_inputs(bases, request, prompts),
+            Some(prompts) => router_token_inputs(
+                workers.iter().map(|worker| worker.base_url().to_owned()),
+                request,
+                prompts,
+            ),
             None => {
                 prepare_http_token_inputs(
                     &self.client,
-                    bases,
+                    workers.to_vec(),
                     request,
                     route,
                     headers,
@@ -578,7 +580,7 @@ impl PdKvState {
             return None;
         }
         let results = self
-            .tokenize(bases, request, route, headers, router_prompts)
+            .tokenize(workers, request, route, headers, router_prompts)
             .await;
         self.decode_context_from_results(
             kv,

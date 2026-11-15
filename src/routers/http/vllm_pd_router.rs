@@ -6495,7 +6495,12 @@ mod tests {
             )
             .route(
                 "/v1/completions/render",
-                post(render).with_state(RenderCount(prefill_renders.clone())),
+                post(
+                    |count: State<RenderCount>, Json(_): Json<serde_json::Map<String, Value>>| {
+                        render(count)
+                    },
+                )
+                .with_state(RenderCount(prefill_renders.clone())),
             )
             .route(
                 "/v1/completions",

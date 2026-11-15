@@ -5,6 +5,7 @@ use super::program_adapter::{
 use crate::backend::health::check_grpc_health_within;
 use crate::backend::preprocess::{
     http_cache_read_fallback, prepare_completion_direct_inputs, prepare_http_kv_inputs,
+    warm_http_render_support,
 };
 use crate::backend::token_count::{
     client_token_ids_fingerprint, exact_prompt_tokens_from_json, prepared_chat_fingerprint,
@@ -565,6 +566,7 @@ impl Router {
         } else {
             None
         };
+        let mut render_probe_workers = Vec::new();
         for url in &worker_urls {
             let (base_url, dp_rank) = dp_utils::parse_worker_url(url);
             // KV-aware placement distinguishes base aliases from adapter names.
@@ -640,6 +642,9 @@ impl Router {
             // Notify PolicyRegistry about the new worker
             let model_id = worker_arc.model_id();
             let policy = ctx.policy_registry.on_worker_added(model_id, None);
+            if policy.needs_cache_routing_key() || kv_aware_ops(policy.as_ref()).is_some() {
+                render_probe_workers.push(worker_arc.clone());
+            }
 
             // If this is a cache-aware policy and it's the first worker for this model,
             // initialize it with the worker
@@ -817,6 +822,13 @@ impl Router {
                 }
             }))
         });
+
+        warm_http_render_support(
+            &ctx.client,
+            &render_probe_workers,
+            ctx.router_config.api_key.as_deref(),
+        )
+        .await;
 
         let kv_reconcile_handle = kv_index_supervisor.as_ref().map(|supervisor| {
             let supervisor = Arc::downgrade(supervisor);
@@ -2987,6 +2999,7 @@ impl Router {
 
             match health_result {
                 Ok(()) => {
+                    let mut render_probe_workers = Vec::new();
                     if self.intra_node_data_parallel_size > 1 {
                         // Expand worker URL into multiple DP-aware URLs based on configured intra_node_data_parallel_size
                         // (e.g., "http://host:8000" → "http://host:8000@0", "@1", etc.)
@@ -3047,6 +3060,11 @@ impl Router {
                             // Notify PolicyRegistry about the new worker
                             let model_id = worker_arc.model_id();
                             let policy = self.policy_registry.on_worker_added(model_id, None);
+                            if policy.needs_cache_routing_key()
+                                || kv_aware_ops(policy.as_ref()).is_some()
+                            {
+                                render_probe_workers.push(worker_arc.clone());
+                            }
 
                             // If this is a cache-aware policy, update it with all workers for this model
                             if policy.needs_cache_routing_key() {
@@ -3100,7 +3118,7 @@ impl Router {
                                 .with_health_config(self.health_config.clone())
                                 .with_worker_api_key(worker_api_key.clone());
 
-                        let worker_arc = Arc::new(new_worker);
+                        let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                         self.worker_registry.register(worker_arc.clone());
                         self.register_kv_target(
                             worker_arc.as_ref(),
@@ -3110,6 +3128,11 @@ impl Router {
                         // Notify PolicyRegistry about the new worker
                         let model_id = worker_arc.model_id();
                         let policy = self.policy_registry.on_worker_added(model_id, None);
+                        if policy.needs_cache_routing_key()
+                            || kv_aware_ops(policy.as_ref()).is_some()
+                        {
+                            render_probe_workers.push(worker_arc.clone());
+                        }
 
                         // If this is a cache-aware policy, add this worker to it
                         if policy.needs_cache_routing_key() {
@@ -3125,6 +3148,12 @@ impl Router {
                         }
                     }
 
+                    warm_http_render_support(
+                        &self.client,
+                        &render_probe_workers,
+                        self.api_key.as_deref(),
+                    )
+                    .await;
                     RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
 
                     return Ok(format!("Successfully added worker: {}", worker_url));
@@ -4880,21 +4909,23 @@ mod tests {
         let app = axum::Router::new()
             .route(
                 "/v1/completions/render",
-                axum::routing::post(move || {
-                    let held = held.lock().take().unwrap();
-                    let (started, finished) = (started.clone(), finished.clone());
-                    async move {
-                        // The Worker job can outlive its cancelled HTTP connection.
-                        tokio::spawn(async move {
-                            started.send(()).unwrap();
-                            held.await.unwrap();
-                            finished.send(()).unwrap();
-                            Json(serde_json::json!([{"token_ids":[1,2],"features":null}]))
-                        })
-                        .await
-                        .unwrap()
-                    }
-                }),
+                axum::routing::post(
+                    move |Json(_): Json<serde_json::Map<String, serde_json::Value>>| {
+                        let held = held.lock().take().unwrap();
+                        let (started, finished) = (started.clone(), finished.clone());
+                        async move {
+                            // The Worker job can outlive its cancelled HTTP connection.
+                            tokio::spawn(async move {
+                                started.send(()).unwrap();
+                                held.await.unwrap();
+                                finished.send(()).unwrap();
+                                Json(serde_json::json!([{"token_ids":[1,2],"features":null}]))
+                            })
+                            .await
+                            .unwrap()
+                        }
+                    },
+                ),
             )
             .route(
                 "/v1/completions",
@@ -5059,10 +5090,14 @@ mod tests {
             let app = axum::Router::new()
                 .route(
                     "/v1/completions/render",
-                    axum::routing::post(move || {
-                        prepare.fetch_add(1, Ordering::Relaxed);
-                        async { Json(serde_json::json!([{"token_ids":[1,3,4],"features":null}])) }
-                    }),
+                    axum::routing::post(
+                        move |Json(_): Json<serde_json::Map<String, serde_json::Value>>| {
+                            prepare.fetch_add(1, Ordering::Relaxed);
+                            async {
+                                Json(serde_json::json!([{"token_ids":[1,3,4],"features":null}]))
+                            }
+                        },
+                    ),
                 )
                 .route(
                     "/v1/completions",
@@ -5246,7 +5281,7 @@ mod tests {
         let prepare = preparations.clone();
         let source_url = worker.url().to_owned();
         let app = axum::Router::new()
-            .route("/v1/completions/render", axum::routing::post(move || {
+            .route("/v1/completions/render", axum::routing::post(move |Json(_): Json<serde_json::Map<String, serde_json::Value>>| {
                 prepare.fetch_add(1, Ordering::Relaxed);
                 async move {
                     Json(serde_json::json!([{"token_ids":[1,3,4,3,4,3,4,3,4],"features":null}]))
@@ -5645,6 +5680,10 @@ mod tests {
                 let fail_first = fail_first.clone();
                 async move {
                     let path = uri.path().to_string();
+                    // vLLM validates typed render requests before the handler runs.
+                    if render_available && path.ends_with("/render") && body.is_array() {
+                        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+                    }
                     captured.lock().push((worker_index, path.clone(), body));
                     if path.ends_with("/render") {
                         if prompts.is_empty() {
